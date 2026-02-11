@@ -16,7 +16,6 @@ import shutil
 import traceback
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
-
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
@@ -44,13 +43,19 @@ allow_creds = os.getenv("FMAP_CORS_ALLOW_CREDENTIALS", "false").strip().lower() 
 if allow_creds and not origins:
     raise RuntimeError("FMAP_CORS_ORIGINS is required when FMAP_CORS_ALLOW_CREDENTIALS=true")
 
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins or ["*"],  # server-to-server is fine; restrict in production
-    allow_credentials=allow_creds,
+    allow_origins=[
+        "https://fmap.agrimetsoft.com",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,     # set False if you don’t use cookies/auth
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # Simple in-memory job store (sufficient for a single Render instance)
 JOBS: Dict[str, Dict[str, Any]] = {}
