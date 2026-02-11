@@ -151,19 +151,59 @@ def resample_to_profile(src_path: str, dst_profile: dict, resampling=Resampling.
         )
         return dst_arr
 
-def _fix_pr_units_mm(pr_series: pd.Series) -> pd.Series:
-    p99 = np.nanpercentile(pr_series.values.astype("float32"), 99)
-    if p99 > 200:
-        return pr_series.astype("float32") / 100.0
-    if p99 > 100:
-        return pr_series.astype("float32") / 10.0
-    return pr_series.astype("float32")
+# ---- gridMET packed value decoding (scale_factor/add_offset) ----
+# The gridMET THREDDS/NCSS CSV responses often return packed integer values.
+# We decode them using the dataset's CF attributes (scale_factor, add_offset).
+_GRIDMET_SCALE_CACHE: Dict[tuple, tuple] = {}
 
-def _fix_temp_units_C(t_series: pd.Series) -> pd.Series:
-    med = np.nanmedian(t_series.values.astype("float32"))
-    if med > 100:
-        return t_series.astype("float32") - 273.15
-    return t_series.astype("float32")
+# Safe defaults (as of Feb 2026). Used if metadata lookup fails.
+# Tuple: (scale_factor, add_offset)
+_GRIDMET_DEFAULTS: Dict[tuple, tuple] = {
+    ("pr",   "precipitation_amount"): (0.1, 0.0),   # mm
+    ("tmmx", "daily_maximum_temperature"): (0.1, 220.0),  # K
+    ("tmmn", "daily_minimum_temperature"): (0.1, 210.0),  # K
+    ("vpd",  "daily_mean_vapor_pressure_deficit"): (0.01, 0.0),  # kPa
+}
+
+def gridmet_scale_offset(dataset_id: str, varname: str) -> tuple:
+    key = (dataset_id, varname)
+    if key in _GRIDMET_SCALE_CACHE:
+        return _GRIDMET_SCALE_CACHE[key]
+
+    # Try to read attributes from the dataset's OPeNDAP HTML page (fast + no NetCDF client needed)
+    url = f"https://tds-proxy.nkn.uidaho.edu/thredds/dodsC/agg_met_{dataset_id}_1979_CurrentYear_CONUS.nc.html"
+    try:
+        r = safe_get(url, timeout=30)
+        txt = r.text or ""
+        # Variable line typically contains: "... scale_factor: X add_offset: Y ..."
+        pat = re.compile(rf"{re.escape(varname)}.*?scale_factor:\s*([0-9eE.+\-]+).*?add_offset:\s*([0-9eE.+\-]+)", re.S)
+        m = pat.search(txt)
+        if m:
+            sf = float(m.group(1))
+            off = float(m.group(2))
+            _GRIDMET_SCALE_CACHE[key] = (sf, off)
+            return sf, off
+    except Exception:
+        pass
+
+    if key in _GRIDMET_DEFAULTS:
+        _GRIDMET_SCALE_CACHE[key] = _GRIDMET_DEFAULTS[key]
+        return _GRIDMET_DEFAULTS[key]
+
+    # Fallback (no scaling)
+    _GRIDMET_SCALE_CACHE[key] = (1.0, 0.0)
+    return (1.0, 0.0)
+
+def gridmet_decode(series: pd.Series, dataset_id: str, varname: Optional[str]) -> pd.Series:
+    s = series.astype("float32")
+    if not varname:
+        return s
+    sf, off = gridmet_scale_offset(dataset_id, varname)
+    return s * float(sf) + float(off)
+
+def gridmet_decode_temp_C(series: pd.Series, dataset_id: str, varname: Optional[str], kelvin_to_C=True) -> pd.Series:
+    k = gridmet_decode(series, dataset_id, varname)
+    return (k - 273.15) if kelvin_to_C else k
 
 # -------------------------
 # SPI helpers
@@ -772,11 +812,11 @@ def run_download_pipeline(
 
     out = pd.DataFrame({"time": t})
     if pr_col:
-        out["pr_mm"] = _fix_pr_units_mm(df_pr[pr_col])
+        out["pr_mm"] = gridmet_decode(df_pr[pr_col], "pr", meta.get("gridmet_pr_var"))
     if tx_col:
-        out["tmax_C"] = _fix_temp_units_C(df_tx[tx_col])
+        out["tmax_C"] = gridmet_decode_temp_C(df_tx[tx_col], "tmmx", meta.get("gridmet_tmmx_var"))
     if tn_col:
-        out["tmin_C"] = _fix_temp_units_C(df_tn[tn_col])
+        out["tmin_C"] = gridmet_decode_temp_C(df_tn[tn_col], "tmmn", meta.get("gridmet_tmmn_var"))
     if "tmax_C" in out.columns and "tmin_C" in out.columns:
         out["tmean_C"] = (out["tmax_C"] + out["tmin_C"]) / 2.0
     if vpd_col:
@@ -789,7 +829,7 @@ def run_download_pipeline(
     # -------------------------
     if "pr" in clim_point:
         spi_csv = os.path.join(job_dir, "gridmet_pr_point_for_spi.csv")
-        _, dfp, _ = ncss_point_csv("pr", GRIDMET_DATASETS["pr"]["vars"], pt_lon, pt_lat, spi_start, date_end, spi_csv)
+        _, dfp, used_spi_var = ncss_point_csv("pr", GRIDMET_DATASETS["pr"]["vars"], pt_lon, pt_lat, spi_start, date_end, spi_csv)
         dfp["time"] = pd.to_datetime(dfp["time"], utc=True).dt.tz_convert(None)
         dfp = dfp.sort_values("time").set_index("time")
 
@@ -797,7 +837,7 @@ def run_download_pipeline(
         if pr_col2 is None:
             pr_col2 = dfp.select_dtypes(include=[np.number]).columns.tolist()[-1]
 
-        pr = _fix_pr_units_mm(dfp[pr_col2])
+        pr = gridmet_decode(dfp[pr_col2], "pr", used_spi_var)
         spi30_all = spi_gamma_monthly(pr, window=30, min_samples_per_month=60, fallback_to_pooled=True)
 
         start_ts = pd.to_datetime(date_start)

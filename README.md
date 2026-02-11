@@ -80,11 +80,20 @@ Environment variables:
 - `FMAP_JOB_ROOT`: where job outputs are written (default `/tmp/fmap_jobs`)
 
 
-## Gemini interpretation (optional)
+## CORS
 
-Set Render environment variable `GEMINI_API_KEY` (from Google AI Studio) and optionally `GEMINI_MODEL`.
+If you call this API from a browser (e.g., `https://fmap.agrimetsoft.com`), set:
 
-Then call:
+- `FMAP_CORS_ORIGINS=https://fmap.agrimetsoft.com`
 
-- `POST /ai/gemini` with JSON: `{ "job_id": "...", "mode": "technical" }`
+Optional (only if you truly need cookies/credentials):
 
+- `FMAP_CORS_ALLOW_CREDENTIALS=true` (requires `FMAP_CORS_ORIGINS` to be explicitly set)
+
+## gridMET decoding
+
+The gridMET THREDDS/NCSS CSV responses can return **packed integer values**. This backend decodes them using each variable's `scale_factor` and `add_offset` (cached), so `climate_point_clean.csv` contains realistic units:
+
+- precipitation → mm
+- tmmx/tmmn → °C
+- vpd → kPa

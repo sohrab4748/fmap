@@ -19,14 +19,13 @@ from typing import Any, Dict, Optional
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field, model_validator
 
 from fmap_download import run_download_pipeline
 from fmap_analysis import run_analysis, build_manifest
-from fmap_gemini import interpret_with_gemini
 
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.1.1"
 JOB_ROOT = os.getenv("FMAP_JOB_ROOT", "/tmp/fmap_jobs")
 MAX_JOB_AGE_SECONDS = int(os.getenv("FMAP_MAX_JOB_AGE_SECONDS", "86400"))  # 24h
 
@@ -41,10 +40,14 @@ if cors:
 else:
     origins = []
 
+allow_creds = os.getenv("FMAP_CORS_ALLOW_CREDENTIALS", "false").strip().lower() in ("1","true","yes")
+if allow_creds and not origins:
+    raise RuntimeError("FMAP_CORS_ORIGINS is required when FMAP_CORS_ALLOW_CREDENTIALS=true")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins or ["*"],  # server-to-server is fine; restrict in production
-    allow_credentials=True,
+    allow_credentials=allow_creds,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -120,20 +123,6 @@ class StatusResponse(BaseModel):
     finished_at: Optional[str] = None
     error: Optional[str] = None
 
-
-class GeminiInterpretRequest(BaseModel):
-    job_id: str = Field(..., description="Job id from /fmap/run or /fmap/run_sync")
-    mode: str = Field("technical", description="technical | executive | public")
-    model: Optional[str] = Field(None, description="Override model name (default from GEMINI_MODEL env var)")
-    extra_instructions: Optional[str] = Field(None, description="Optional extra instruction appended to prompt")
-
-
-class GeminiInterpretResponse(BaseModel):
-    job_id: str
-    model: str
-    mode: str
-    text: str
-    generated_at: str
 
 class ResultResponse(BaseModel):
     job_id: str
@@ -220,6 +209,11 @@ def health():
 @app.get("/")
 def root():
     return {"service": "FMAP-AI API", "version": APP_VERSION, "docs": "/docs"}
+
+
+@app.head("/")
+def root_head():
+    return Response(status_code=200)
 
 
 @app.post("/fmap/run", response_model=RunResponse)
@@ -328,36 +322,3 @@ def download(job_id: str):
         raise HTTPException(status_code=404, detail="ZIP not available for this job (run with include_zip=true).")
 
     return FileResponse(zip_path, media_type="application/zip", filename=os.path.basename(zip_path))
-
-
-@app.post("/ai/gemini", response_model=GeminiInterpretResponse)
-def gemini_interpret(req: GeminiInterpretRequest):
-    meta = JOBS.get(req.job_id)
-    if not meta:
-        raise HTTPException(status_code=404, detail="Unknown job_id")
-    if meta.get("status") != "done":
-        raise HTTPException(status_code=409, detail={"status": meta.get("status"), "message": "Job not finished. Call /fmap/status and /fmap/result first."})
-
-    # Prefer in-memory analysis; fall back to file in job dir
-    analysis = meta.get("analysis")
-    if analysis is None:
-        job_dir = meta.get("job_dir")
-        p = os.path.join(job_dir, "analysis_result.json") if job_dir else None
-        if p and os.path.exists(p):
-            import json
-            with open(p, "r", encoding="utf-8") as f:
-                analysis = json.load(f)
-
-    if analysis is None:
-        raise HTTPException(status_code=500, detail="Analysis not available for this job.")
-
-    model = (req.model or os.getenv("GEMINI_MODEL") or "gemini-3-flash-preview").strip()
-    text = interpret_with_gemini(analysis=analysis, mode=req.mode, model=model, extra=req.extra_instructions)
-
-    return GeminiInterpretResponse(
-        job_id=req.job_id,
-        model=model,
-        mode=req.mode,
-        text=text,
-        generated_at=_utc_now(),
-    )
