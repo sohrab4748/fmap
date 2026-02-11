@@ -78,3 +78,13 @@ Environment variables:
 - `FMAP_CORS_ORIGINS`: comma-separated list (or `*`)
 - `FMAP_MAX_JOB_AGE_SECONDS`: cleanup threshold
 - `FMAP_JOB_ROOT`: where job outputs are written (default `/tmp/fmap_jobs`)
+
+
+## Gemini interpretation (optional)
+
+Set Render environment variable `GEMINI_API_KEY` (from Google AI Studio) and optionally `GEMINI_MODEL`.
+
+Then call:
+
+- `POST /ai/gemini` with JSON: `{ "job_id": "...", "mode": "technical" }`
+
