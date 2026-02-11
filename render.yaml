@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: fmap-ai-api
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.8
+      - key: FMAP_MAX_JOB_AGE_SECONDS
+        value: 86400
+      - key: FMAP_CORS_ORIGINS
+        value: "*"
