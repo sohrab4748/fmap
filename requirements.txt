@@ -12,3 +12,4 @@ planetary-computer==1.0.0
 
 rasterio==1.3.10
 pyproj==3.6.1
+gunicorn
