@@ -28,6 +28,13 @@ APP_VERSION = "0.1.1"
 JOB_ROOT = os.getenv("FMAP_JOB_ROOT", "/tmp/fmap_jobs")
 MAX_JOB_AGE_SECONDS = int(os.getenv("FMAP_MAX_JOB_AGE_SECONDS", "86400"))  # 24h
 
+# Guardrails for Render temporary storage (free instances are typically evicted around ~2GB).
+# - MAX_JOB_BYTES: soft ceiling for a single job directory. If exceeded, we prune intermediates.
+# - ZIP_MAX_BYTES: refuse to build a ZIP if the directory is larger than this, to avoid duplicating
+#   the same bytes during zipping and triggering eviction.
+MAX_JOB_BYTES = int(os.getenv("FMAP_MAX_JOB_BYTES", str(int(1.6 * 1024**3))))  # ~1.6GB
+ZIP_MAX_BYTES = int(os.getenv("FMAP_ZIP_MAX_BYTES", str(int(900 * 1024**2))))  # ~900MB
+
 os.makedirs(JOB_ROOT, exist_ok=True)
 
 app = FastAPI(title="FMAP-AI API", version=APP_VERSION)
@@ -66,7 +73,111 @@ def _job_dir(job_id: str) -> str:
     return os.path.join(JOB_ROOT, job_id)
 
 
+def _dir_size_bytes(path: str) -> int:
+    """Return recursive directory size in bytes (best-effort)."""
+    total = 0
+    try:
+        for root, _dirs, files in os.walk(path):
+            for fn in files:
+                try:
+                    fp = os.path.join(root, fn)
+                    total += os.path.getsize(fp)
+                except Exception:
+                    pass
+    except Exception:
+        return total
+    return total
+
+
+def _safe_rmtree(path: str) -> None:
+    try:
+        if path and os.path.exists(path):
+            shutil.rmtree(path, ignore_errors=True)
+    except Exception:
+        pass
+
+
+def _cleanup_old_job_dirs() -> None:
+    """Filesystem-based cleanup (works even after instance restarts and JOBS is empty)."""
+    now = time.time()
+    try:
+        for name in os.listdir(JOB_ROOT):
+            p = os.path.join(JOB_ROOT, name)
+            if not os.path.isdir(p):
+                continue
+            try:
+                age = now - os.path.getmtime(p)
+            except Exception:
+                age = now - now
+            if age > MAX_JOB_AGE_SECONDS:
+                _safe_rmtree(p)
+    except Exception:
+        pass
+
+
+def _prune_job_dir(job_dir: str, keep_rasters: bool, keep_zip: bool) -> Dict[str, Any]:
+    """Remove large intermediates to keep Render temp storage under control."""
+    before = _dir_size_bytes(job_dir)
+
+    # Always remove sampling intermediates
+    _safe_rmtree(os.path.join(job_dir, "region_samples"))
+    _safe_rmtree(os.path.join(job_dir, "__pycache__"))
+
+    removed_files = 0
+    removed_bytes = 0
+
+    large_exts = (".tif", ".tiff", ".nc", ".hdf", ".h5", ".grib", ".grb", ".npy", ".npz")
+    tmp_exts = (".tmp", ".part", ".cache")
+
+    for root, _dirs, files in os.walk(job_dir):
+        for fn in files:
+            fp = os.path.join(root, fn)
+            lower = fn.lower()
+            try:
+                size = os.path.getsize(fp)
+            except Exception:
+                size = 0
+
+            # Always remove obvious temp/cache artifacts
+            if lower.endswith(tmp_exts):
+                try:
+                    os.remove(fp)
+                    removed_files += 1
+                    removed_bytes += size
+                except Exception:
+                    pass
+                continue
+
+            # Optionally remove large rasters/grids
+            if (not keep_rasters) and lower.endswith(large_exts):
+                try:
+                    os.remove(fp)
+                    removed_files += 1
+                    removed_bytes += size
+                except Exception:
+                    pass
+                continue
+
+            # Optionally remove zip artifacts (rare; usually keep_zip is True only when include_zip)
+            if (not keep_zip) and lower.endswith(".zip"):
+                try:
+                    os.remove(fp)
+                    removed_files += 1
+                    removed_bytes += size
+                except Exception:
+                    pass
+
+    after = _dir_size_bytes(job_dir)
+    return {
+        "before_bytes": int(before),
+        "after_bytes": int(after),
+        "removed_files": int(removed_files),
+        "removed_bytes": int(removed_bytes),
+    }
+
+
 def _cleanup_old_jobs() -> None:
+    _cleanup_old_job_dirs()
     now = time.time()
     dead = []
     for jid, meta in list(JOBS.items()):
@@ -78,7 +189,7 @@ def _cleanup_old_jobs() -> None:
         try:
             d = JOBS[jid].get("job_dir")
             if d and os.path.exists(d):
-                shutil.rmtree(d, ignore_errors=True)
+                _safe_rmtree(d)
         except Exception:
             pass
         JOBS.pop(jid, None)
@@ -176,6 +287,16 @@ def _run_job(job_id: str, req: RunRequest) -> None:
             size_px=req.size_px,
         )
 
+        # Storage guardrail (Render free instances can be evicted near ~2GB temp usage).
+        bytes_after_download = _dir_size_bytes(job_dir)
+        JOBS[job_id]["job_dir_bytes_after_download"] = int(bytes_after_download)
+        if bytes_after_download > MAX_JOB_BYTES:
+            raise RuntimeError(
+                "Job outputs exceeded the instance storage guardrail after download "
+                f"({bytes_after_download/1024**2:.1f} MB). Reduce bbox/size_px, "
+                "limit products, or run on an instance with persistent disk."
+            )
+
         analysis = run_analysis(job_dir=job_dir, request=req.model_dump(), download_meta=download_meta)
 
         # --- Optional time-series products (point and/or region) ---
@@ -196,21 +317,27 @@ def _run_job(job_id: str, req: RunRequest) -> None:
         except Exception as e:
             if isinstance(analysis, dict):
                 analysis["timeseries"] = {"available": False, "warnings": [f"Time series packaging failed: {e}"]}
+        # Prune intermediates and (optionally) large rasters to keep temp storage under control.
+        prune_report = _prune_job_dir(job_dir, keep_rasters=req.keep_rasters, keep_zip=req.include_zip)
+        JOBS[job_id]["prune_report"] = prune_report
+        if prune_report.get("after_bytes", 0) > MAX_JOB_BYTES:
+            raise RuntimeError(
+                "Job outputs are still too large for this instance after pruning "
+                f"({prune_report.get('after_bytes', 0)/1024**2:.1f} MB). "
+                "Try keep_rasters=false, reduce bbox/size_px, or upgrade to a persistent-disk instance."
+            )
+
         manifest = build_manifest(job_dir)
 
-        # Optionally remove large rasters
-        if not req.keep_rasters:
-            for fn in os.listdir(job_dir):
-                if fn.lower().endswith((".tif", ".tiff", ".nc")):
-                    try:
-                        os.remove(os.path.join(job_dir, fn))
-                    except Exception:
-                        pass
-            manifest = build_manifest(job_dir)
-
-        # Optionally build zip for user download
+        # Optionally build zip for user download (zipping duplicates bytes temporarily).
         zip_path = None
         if req.include_zip:
+            bytes_for_zip = _dir_size_bytes(job_dir)
+            if bytes_for_zip > ZIP_MAX_BYTES:
+                raise RuntimeError(
+                    "Refusing to build ZIP because outputs are too large for safe zipping on this instance "
+                    f"({bytes_for_zip/1024**2:.1f} MB). Try keep_rasters=false or reduce bbox/size_px."
+                )
             zip_path = shutil.make_archive(os.path.join(job_dir, f"{job_id}_outputs"), "zip", job_dir)
 
         JOBS[job_id].update(
@@ -234,6 +361,13 @@ def _run_job(job_id: str, req: RunRequest) -> None:
                 "traceback": tb,
             }
         )
+
+        # Always try to reclaim disk if a job fails (prevents repeated evictions).
+        try:
+            _safe_rmtree(job_dir)
+            JOBS[job_id]["job_dir_cleaned"] = True
+        except Exception:
+            pass
 
 
 @app.get("/health")
