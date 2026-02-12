@@ -46,16 +46,13 @@ if allow_creds and not origins:
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://fmap.agrimetsoft.com",
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
-    allow_credentials=True,     # set False if you don’t use cookies/auth
+    # Allow calls from any frontend origin (including file:// and custom domains).
+    # No cookies/credentials are used, so wildcard origins are safe here.
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 # Simple in-memory job store (sufficient for a single Render instance)
 JOBS: Dict[str, Dict[str, Any]] = {}
