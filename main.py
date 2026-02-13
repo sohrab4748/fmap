@@ -208,6 +208,7 @@ class RunRequest(BaseModel):
     spi_start: str = Field("1981-01-01", description="YYYY-MM-DD")
 
     cloud_cover_lt: float = Field(30.0, ge=0.0, le=100.0, description="Landsat scene filter")
+    include_landsat: bool = Field(False, description="If true, download Landsat indices (NDVI/NDMI/NBR). Disabled by default for fast runs.")
 
     # Output controls
     include_zip: bool = Field(False, description="If true, prepare a zip and expose /fmap/download/{job_id}")
@@ -285,6 +286,7 @@ def _run_job(job_id: str, req: RunRequest) -> None:
             spi_start=req.spi_start,
             cloud_cover_lt=req.cloud_cover_lt,
             size_px=req.size_px,
+            include_landsat=req.include_landsat,
         )
 
         # Storage guardrail (Render free instances can be evicted near ~2GB temp usage).
