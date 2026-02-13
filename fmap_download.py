@@ -611,6 +611,8 @@ def run_download_pipeline(
     spi_start: str,
     cloud_cover_lt: float = 30.0,
     size_px: int = 900,
+    include_landsat: bool = False,
+    landsat_max_items: int = 50,
 ) -> Dict[str, Union[str, float, int, None]]:
     """Run the full download pipeline and return a metadata dict."""
 
@@ -624,56 +626,89 @@ def run_download_pipeline(
         "date_end": date_end,
         "spi_start": spi_start,
     }
+    meta["include_landsat"] = bool(include_landsat)
 
     # -------------------------
     # 1) Landsat vegetation indices
     # -------------------------
-    catalog = _stac_client()
-    search = catalog.search(
-        collections=["landsat-c2-l2"],
-        bbox=list(bbox_lonlat),
-        datetime=f"{date_start}/{date_end}",
-        query={"eo:cloud_cover": {"lt": cloud_cover_lt}},
-    )
-    items = list(search.items())
-    if not items:
-        raise RuntimeError("No Landsat scenes found. Try wider date range or larger bbox.")
-    item = sorted(items, key=lambda it: it.properties.get("eo:cloud_cover", 999))[0]
-    meta["landsat_item_id"] = item.id
-    meta["landsat_cloud_cover"] = float(item.properties.get("eo:cloud_cover", np.nan))
+    # NOTE: Landsat step is optional. Default include_landsat=False for faster/safer runs on small instances.
+    landsat_prof = None
+    ndvi = ndmi = nbr = None
+    if include_landsat:
+        try:
+            catalog = _stac_client()
+            search = catalog.search(
+                collections=["landsat-c2-l2"],
+                bbox=list(bbox_lonlat),
+                datetime=f"{date_start}/{date_end}",
+                query={"eo:cloud_cover": {"lt": cloud_cover_lt}},
+            )
+            items = []
+            for _k, _it in enumerate(search.items()):
+                items.append(_it)
+                if landsat_max_items and (_k + 1) >= int(landsat_max_items):
+                    break
+            if not items:
+                raise RuntimeError("No Landsat scenes found. Try wider date range or larger bbox.")
+            item = sorted(items, key=lambda it: it.properties.get("eo:cloud_cover", 999))[0]
+            meta["landsat_item_id"] = item.id
+            meta["landsat_cloud_cover"] = float(item.properties.get("eo:cloud_cover", np.nan))
 
-    red_key   = pick_asset_key(item, ["red", "SR_B4", "B04"])
-    nir_key   = pick_asset_key(item, ["nir08", "SR_B5", "B08"])
-    swir1_key = pick_asset_key(item, ["swir16", "SR_B6", "B11"])
-    swir2_key = pick_asset_key(item, ["swir22", "SR_B7", "B12"])
+            red_key   = pick_asset_key(item, ["red", "SR_B4", "B04"])
+            nir_key   = pick_asset_key(item, ["nir08", "SR_B5", "B08"])
+            swir1_key = pick_asset_key(item, ["swir16", "SR_B6", "B11"])
+            swir2_key = pick_asset_key(item, ["swir22", "SR_B7", "B12"])
 
-    red, landsat_prof, _   = read_cog_subset(item.assets[red_key].href,   bbox_lonlat=bbox_lonlat)
-    nir, _, _              = read_cog_subset(item.assets[nir_key].href,   bbox_lonlat=bbox_lonlat)
-    swir1, _, _            = read_cog_subset(item.assets[swir1_key].href, bbox_lonlat=bbox_lonlat)
-    swir2, _, _            = read_cog_subset(item.assets[swir2_key].href, bbox_lonlat=bbox_lonlat)
+            red, landsat_prof, _   = read_cog_subset(item.assets[red_key].href,   bbox_lonlat=bbox_lonlat)
+            nir, _, _              = read_cog_subset(item.assets[nir_key].href,   bbox_lonlat=bbox_lonlat)
+            swir1, _, _            = read_cog_subset(item.assets[swir1_key].href, bbox_lonlat=bbox_lonlat)
+            swir2, _, _            = read_cog_subset(item.assets[swir2_key].href, bbox_lonlat=bbox_lonlat)
 
-    red_f   = apply_stac_scale_offset(item, red_key, red)
-    nir_f   = apply_stac_scale_offset(item, nir_key, nir)
-    swir1_f = apply_stac_scale_offset(item, swir1_key, swir1)
-    swir2_f = apply_stac_scale_offset(item, swir2_key, swir2)
+            red_f   = apply_stac_scale_offset(item, red_key, red)
+            nir_f   = apply_stac_scale_offset(item, nir_key, nir)
+            swir1_f = apply_stac_scale_offset(item, swir1_key, swir1)
+            swir2_f = apply_stac_scale_offset(item, swir2_key, swir2)
 
-    ndvi = (nir_f - red_f) / (nir_f + red_f + 1e-6)
-    ndmi = (nir_f - swir1_f) / (nir_f + swir1_f + 1e-6)
-    nbr  = (nir_f - swir2_f) / (nir_f + swir2_f + 1e-6)
+            ndvi = (nir_f - red_f) / (nir_f + red_f + 1e-6)
+            ndmi = (nir_f - swir1_f) / (nir_f + swir1_f + 1e-6)
+            nbr  = (nir_f - swir2_f) / (nir_f + swir2_f + 1e-6)
 
-    ndvi_path = os.path.join(job_dir, "ndvi_bbox.tif")
-    ndmi_path = os.path.join(job_dir, "ndmi_bbox.tif")
-    nbr_path  = os.path.join(job_dir, "nbr_bbox.tif")
-    write_geotiff(ndvi_path, ndvi, landsat_prof, dtype="float32")
-    write_geotiff(ndmi_path, ndmi, landsat_prof, dtype="float32")
-    write_geotiff(nbr_path,  nbr,  landsat_prof, dtype="float32")
+            ndvi_path = os.path.join(job_dir, "ndvi_bbox.tif")
+            ndmi_path = os.path.join(job_dir, "ndmi_bbox.tif")
+            nbr_path  = os.path.join(job_dir, "nbr_bbox.tif")
+            write_geotiff(ndvi_path, ndvi, landsat_prof, dtype="float32")
+            write_geotiff(ndmi_path, ndmi, landsat_prof, dtype="float32")
+            write_geotiff(nbr_path,  nbr,  landsat_prof, dtype="float32")
 
-    meta["ndvi_mean_bbox"] = float(np.nanmean(ndvi))
-    meta["ndmi_mean_bbox"] = float(np.nanmean(ndmi))
-    meta["nbr_mean_bbox"]  = float(np.nanmean(nbr))
-    meta["ndvi_point"] = float(sample_raster_point(ndvi_path, pt_lon, pt_lat))
-    meta["ndmi_point"] = float(sample_raster_point(ndmi_path, pt_lon, pt_lat))
-    meta["nbr_point"]  = float(sample_raster_point(nbr_path,  pt_lon, pt_lat))
+            meta["ndvi_mean_bbox"] = float(np.nanmean(ndvi))
+            meta["ndmi_mean_bbox"] = float(np.nanmean(ndmi))
+            meta["nbr_mean_bbox"]  = float(np.nanmean(nbr))
+            meta["ndvi_point"] = float(sample_raster_point(ndvi_path, pt_lon, pt_lat))
+            meta["ndmi_point"] = float(sample_raster_point(ndmi_path, pt_lon, pt_lat))
+            meta["nbr_point"]  = float(sample_raster_point(nbr_path,  pt_lon, pt_lat))
+        except Exception as e:
+            meta["landsat_error"] = str(e)
+            meta["landsat_skipped"] = True
+            meta.setdefault("landsat_item_id", None)
+            meta.setdefault("landsat_cloud_cover", None)
+            meta.setdefault("landsat_datetime", None)
+            meta.setdefault("ndvi_mean_bbox", float("nan"))
+            meta.setdefault("ndmi_mean_bbox", float("nan"))
+            meta.setdefault("nbr_mean_bbox", float("nan"))
+            meta.setdefault("ndvi_point", float("nan"))
+            meta.setdefault("ndmi_point", float("nan"))
+            meta.setdefault("nbr_point", float("nan"))
+    else:
+        meta["landsat_skipped"] = True
+        meta.setdefault("landsat_item_id", None)
+        meta.setdefault("landsat_cloud_cover", None)
+        meta.setdefault("landsat_datetime", None)
+        meta.setdefault("ndvi_mean_bbox", float("nan"))
+        meta.setdefault("ndmi_mean_bbox", float("nan"))
+        meta.setdefault("nbr_mean_bbox", float("nan"))
+        meta.setdefault("ndvi_point", float("nan"))
+        meta.setdefault("ndmi_point", float("nan"))
+        meta.setdefault("nbr_point", float("nan"))
 
     # -------------------------
     # 2) NLCD canopy + landcover (forest mask + proxy group)
@@ -763,11 +798,17 @@ def run_download_pipeline(
     meta["forest_mask_point"] = int(sample_raster_point(forest_mask_tif, pt_lon, pt_lat))
 
     # forest-only NDVI mean (mask resampled to landsat)
-    fm_landsat = resample_to_profile(forest_mask_tif, landsat_prof, resampling=Resampling.nearest, dst_dtype="uint8", dst_nodata=0)
-    if float(fm_landsat.mean()) < 0.001:
-        meta["ndvi_forest_mean_bbox"] = float("nan")
-    else:
-        meta["ndvi_forest_mean_bbox"] = float(np.nanmean(np.where(fm_landsat == 1, ndvi, np.nan)))
+    meta["ndvi_forest_mean_bbox"] = float("nan")
+    if include_landsat and (landsat_prof is not None) and (ndvi is not None) and os.path.exists(forest_mask_tif):
+        fm_landsat = resample_to_profile(
+            forest_mask_tif,
+            landsat_prof,
+            resampling=Resampling.nearest,
+            dst_dtype="uint8",
+            dst_nodata=0,
+        )
+        if float(fm_landsat.mean()) >= 0.001:
+            meta["ndvi_forest_mean_bbox"] = float(np.nanmean(np.where(fm_landsat == 1, ndvi, np.nan)))
 
     # -------------------------
     # 3) gridMET point series + cleaned climate CSV
