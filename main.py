@@ -21,8 +21,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field, model_validator
 
-from fmap_download import run_download_pipeline, ncss_point_csv, GRIDMET_DATASETS, spi_gamma_monthly
-from fmap_analysis import run_analysis, build_manifest
+# NOTE: We lazy-import heavy FMAP modules (rasterio, STAC clients, etc.) inside background job code
+# so the web server can bind to $PORT quickly on Render.
+
 
 APP_VERSION = "0.1.1"
 JOB_ROOT = os.getenv("FMAP_JOB_ROOT", "/tmp/fmap_jobs")
@@ -208,7 +209,6 @@ class RunRequest(BaseModel):
     spi_start: str = Field("1981-01-01", description="YYYY-MM-DD")
 
     cloud_cover_lt: float = Field(30.0, ge=0.0, le=100.0, description="Landsat scene filter")
-    include_landsat: bool = Field(False, description="If true, download Landsat indices (NDVI/NDMI/NBR). Disabled by default for fast runs.")
 
     # Output controls
     include_zip: bool = Field(False, description="If true, prepare a zip and expose /fmap/download/{job_id}")
@@ -276,6 +276,10 @@ def _run_job(job_id: str, req: RunRequest) -> None:
     )
 
     try:
+        # Lazy imports: keep startup fast (important for Render port scan)
+        from fmap_download import run_download_pipeline
+        from fmap_analysis import run_analysis, build_manifest
+
         download_meta = run_download_pipeline(
             job_dir=job_dir,
             pt_lon=req.pt_lon,
@@ -286,7 +290,6 @@ def _run_job(job_id: str, req: RunRequest) -> None:
             spi_start=req.spi_start,
             cloud_cover_lt=req.cloud_cover_lt,
             size_px=req.size_px,
-            include_landsat=req.include_landsat,
         )
 
         # Storage guardrail (Render free instances can be evicted near ~2GB temp usage).
@@ -526,7 +529,8 @@ def _resample_timeseries(df: "pd.DataFrame", freq: str) -> "pd.DataFrame":
     if freq == "monthly":
         agg = {}
         for c in out.columns:
-            if c.lower() in ("pr", "precip", "precipitation", "ppt"):
+            cl = c.lower()
+            if cl in ("pr", "precip", "precipitation", "ppt") or cl.startswith("pr_") or "precip" in cl:
                 agg[c] = "sum"
             else:
                 agg[c] = "mean"
@@ -702,12 +706,22 @@ def _compute_region_mean_timeseries(job_dir: str, req: RunRequest) -> None:
     """
     Approximate region-mean daily climate series by sampling multiple points inside the bbox/region and averaging.
     Writes:
-      - climate_region_mean.csv
-      - spi30_region.csv
+      - climate_region_mean.csv   (time, pr_mm, tmax_C, tmin_C, tmean_C, vpd)
+      - spi30_region.csv          (time, spi30)
     """
     import math
     import random
     import pandas as pd
+    import numpy as np
+
+    # Lazy import (avoids slow startup on Render)
+    from fmap_download import (
+        ncss_point_csv,
+        GRIDMET_DATASETS,
+        gridmet_decode,
+        gridmet_decode_temp_C,
+        spi_gamma_monthly,
+    )
 
     bbox = (req.minlon, req.minlat, req.maxlon, req.maxlat)
     start_date = req.date_start
@@ -723,10 +737,7 @@ def _compute_region_mean_timeseries(job_dir: str, req: RunRequest) -> None:
     if region_geojson:
         try:
             from shapely.geometry import shape
-            if isinstance(region_geojson, dict) and region_geojson.get("type") == "Feature":
-                geom = region_geojson.get("geometry")
-            else:
-                geom = region_geojson
+            geom = region_geojson.get("geometry") if isinstance(region_geojson, dict) and region_geojson.get("type") == "Feature" else region_geojson
             poly = shape(geom) if geom else None
         except Exception:
             poly = None
@@ -748,7 +759,6 @@ def _compute_region_mean_timeseries(job_dir: str, req: RunRequest) -> None:
                         pass
                 points.append((lon, lat))
         if len(points) < 1:
-            # fallback: ignore polygon filter
             points = [(lon, lat) for lat in lats for lon in lons]
         points = points[:n_samples]
     else:
@@ -772,31 +782,54 @@ def _compute_region_mean_timeseries(job_dir: str, req: RunRequest) -> None:
     sample_dir = os.path.join(job_dir, "region_samples")
     os.makedirs(sample_dir, exist_ok=True)
 
-    merged: Optional[pd.DataFrame] = None
+    def _pick_numeric(df: "pd.DataFrame") -> Optional[str]:
+        num = df.select_dtypes(include=[np.number]).columns.tolist()
+        return num[-1] if num else None
 
-    for dataset_id, var_candidates in GRIDMET_DATASETS.items():
+    merged: Optional[pd.DataFrame] = None
+    used_vars: Dict[str, str] = {}
+
+    # Build mean series for each dataset key (pr, tmmx, tmmn, vpd)
+    for key, info in GRIDMET_DATASETS.items():
+        dataset_id = info["dataset_id"]
+        var_candidates = info["vars"]
+
         per_var: Optional[pd.DataFrame] = None
         ok_points = 0
 
         for i, (lon, lat) in enumerate(points):
-            out_csv = os.path.join(sample_dir, f"{dataset_id}_p{i+1}.csv")
+            out_csv = os.path.join(sample_dir, f"{key}_p{i+1}.csv")
             try:
-                _, df_pt, _used_var = ncss_point_csv(
-                    dataset_id=dataset_id,
-                    var_candidates=var_candidates,
-                    lon=lon,
-                    lat=lat,
-                    start_date=start_date,
-                    end_date=end_date,
-                    out_csv=out_csv,
-                )
-                vc = [c for c in df_pt.columns if c != "time"]
-                if not vc:
+                _, df_pt, used_var = ncss_point_csv(dataset_id, var_candidates, lon, lat, start_date, end_date, out_csv)
+                used_vars[key] = used_var
+
+                if "time" not in df_pt.columns:
                     continue
-                df_pt = df_pt.rename(columns={vc[0]: f"{dataset_id}_p{i+1}"})
                 df_pt["time"] = pd.to_datetime(df_pt["time"], errors="coerce", utc=True).dt.tz_convert(None)
-                df_pt = df_pt.dropna(subset=["time"])
-                per_var = df_pt if per_var is None else per_var.merge(df_pt, on="time", how="outer")
+                df_pt = df_pt.dropna(subset=["time"]).sort_values("time")
+
+                # Pick the data column (avoid lat/lon columns)
+                var_col = next((c for c in df_pt.columns if c.lower().startswith(dataset_id)), None)
+                if not var_col:
+                    # fallback: last numeric column
+                    var_col = _pick_numeric(df_pt)
+                if not var_col:
+                    continue
+
+                s = df_pt[var_col]
+
+                # Decode packed values (gridMET)
+                if key == "pr":
+                    s = gridmet_decode(s, "pr", used_var)
+                elif key == "tmmx":
+                    s = gridmet_decode_temp_C(s, "tmmx", used_var)
+                elif key == "tmmn":
+                    s = gridmet_decode_temp_C(s, "tmmn", used_var)
+                elif key == "vpd":
+                    s = gridmet_decode(s, "vpd", used_var)
+
+                df_keep = pd.DataFrame({"time": df_pt["time"], f"{key}_p{i+1}": pd.to_numeric(s, errors="coerce")})
+                per_var = df_keep if per_var is None else per_var.merge(df_keep, on="time", how="outer")
                 ok_points += 1
             except Exception:
                 continue
@@ -804,23 +837,37 @@ def _compute_region_mean_timeseries(job_dir: str, req: RunRequest) -> None:
         if per_var is None or ok_points == 0:
             continue
 
-        per_var = per_var.sort_values("time")
-        cols = [c for c in per_var.columns if c.startswith(f"{dataset_id}_p")]
-        per_var[dataset_id] = per_var[cols].astype(float).mean(axis=1, skipna=True)
-        keep = per_var[["time", dataset_id]]
+        cols = [c for c in per_var.columns if c.startswith(f"{key}_p")]
+        per_var[key] = per_var[cols].astype("float64").mean(axis=1, skipna=True)
+        keep = per_var[["time", key]]
+
         merged = keep if merged is None else merged.merge(keep, on="time", how="outer")
 
     if merged is None or merged.empty:
         raise ValueError("Region climate time series could not be built (no datasets downloaded).")
 
     merged = merged.sort_values("time")
-    out_clim = os.path.join(job_dir, "climate_region_mean.csv")
-    merged.to_csv(out_clim, index=False)
+    out = pd.DataFrame({"time": merged["time"]})
 
     if "pr" in merged.columns:
-        pr = pd.to_numeric(merged["pr"], errors="coerce")
-        pr_series = pd.Series(pr.values, index=pd.to_datetime(merged["time"]))
-        spi = spi_gamma_monthly(pr_series, scale_days=30)
+        out["pr_mm"] = merged["pr"].astype("float32")
+    if "tmmx" in merged.columns:
+        out["tmax_C"] = merged["tmmx"].astype("float32")
+    if "tmmn" in merged.columns:
+        out["tmin_C"] = merged["tmmn"].astype("float32")
+    if "tmax_C" in out.columns and "tmin_C" in out.columns:
+        out["tmean_C"] = (out["tmax_C"] + out["tmin_C"]) / 2.0
+    if "vpd" in merged.columns:
+        out["vpd"] = merged["vpd"].astype("float32")
+
+    out_clim = os.path.join(job_dir, "climate_region_mean.csv")
+    out.to_csv(out_clim, index=False)
+
+    # SPI30 (region)
+    if "pr_mm" in out.columns:
+        pr = pd.to_numeric(out["pr_mm"], errors="coerce")
+        pr_series = pd.Series(pr.values, index=pd.to_datetime(out["time"]))
+        spi = spi_gamma_monthly(pr_series, window=30, min_samples_per_month=60, fallback_to_pooled=True)
         spi_df = pd.DataFrame({"time": spi.index, "spi30": spi.values})
         spi_df["time"] = pd.to_datetime(spi_df["time"], utc=True).dt.tz_convert(None)
         out_spi = os.path.join(job_dir, "spi30_region.csv")
