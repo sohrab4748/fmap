@@ -16,8 +16,6 @@ import shutil
 import traceback
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, List, Literal, Tuple
-from multiprocessing import get_context
-import threading
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
@@ -66,87 +64,41 @@ app.add_middleware(
 # Simple in-memory job store (sufficient for a single Render instance)
 JOBS: Dict[str, Dict[str, Any]] = {}
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
-# ----------------------------
-# Job persistence helpers
-# ----------------------------
-def _meta_path(job_id: str) -> str:
-    return os.path.join(_job_dir(job_id), "meta.json")
+# Thread-safe job store + background executor (keeps API responsive during long runs)
+JOBS_LOCK = threading.Lock()
+EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv('FMAP_MAX_WORKERS', '1')))
 
+def _job_meta_path(job_id: str) -> str:
+    return os.path.join(_job_dir(job_id), 'job_meta.json')
 
-def _atomic_write_json(path: str, data: Dict[str, Any]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, default=str, indent=2)
-    os.replace(tmp, path)
+def _persist_job_meta(job_id: str) -> None:
+    """Persist JOBS[job_id] to disk so status/result survive process restarts."""
+    try:
+        with JOBS_LOCK:
+            meta = JOBS.get(job_id)
+            if not meta:
+                return
+            # Ensure JSON-serializable
+            safe = json.loads(json.dumps(meta, default=str))
+        os.makedirs(_job_dir(job_id), exist_ok=True)
+        with open(_job_meta_path(job_id), 'w', encoding='utf-8') as f:
+            json.dump(safe, f, indent=2)
+    except Exception:
+        # Never crash the API because persistence failed
+        return
 
-
-def _read_meta(job_id: str) -> Optional[Dict[str, Any]]:
-    p = _meta_path(job_id)
+def _load_job_meta(job_id: str) -> Optional[Dict[str, Any]]:
+    p = _job_meta_path(job_id)
     if not os.path.exists(p):
         return None
     try:
-        with open(p, "r", encoding="utf-8") as f:
+        with open(p, 'r', encoding='utf-8') as f:
             return json.load(f)
     except Exception:
         return None
-
-
-def _write_meta(job_id: str, meta: Dict[str, Any]) -> None:
-    try:
-        _atomic_write_json(_meta_path(job_id), meta)
-    except Exception:
-        pass
-
-
-def _get_meta(job_id: str) -> Optional[Dict[str, Any]]:
-    meta = JOBS.get(job_id)
-    if meta:
-        return meta
-    meta = _read_meta(job_id)
-    if meta:
-        # cache for this process
-        JOBS[job_id] = meta
-    return meta
-
-
-def _update_meta(job_id: str, patch: Dict[str, Any]) -> None:
-    meta = _get_meta(job_id) or {}
-    meta.update(patch)
-    JOBS[job_id] = meta
-    _write_meta(job_id, meta)
-
-
-def _run_job_entry(job_id: str, req_dict: Dict[str, Any]) -> None:
-    # Entry point for multiprocessing 'spawn'
-    try:
-        req = RunRequest(**req_dict)
-    except Exception as e:
-        _update_meta(job_id, {"status": "error", "finished_at": _utc_now(), "error": f"BadRequest: {e}"})
-        return
-    _run_job(job_id, req)
-
-
-def _spawn_job(job_id: str, req: "RunRequest") -> None:
-    """Run heavy job outside the request lifecycle so /status stays responsive.
-
-    Prefer a separate process (avoids blocking the event loop/GIL). If process creation
-    fails, fall back to a daemon thread.
-    """
-    req_dict = req.model_dump()
-    try:
-        ctx = get_context("spawn")
-        p = ctx.Process(target=_run_job_entry, args=(job_id, req_dict), daemon=True)
-        p.start()
-        _update_meta(job_id, {"worker_pid": p.pid})
-        return
-    except Exception:
-        # Fallback: daemon thread
-        t = threading.Thread(target=_run_job_entry, args=(job_id, req_dict), daemon=True)
-        t.start()
-        _update_meta(job_id, {"worker_thread": True})
-        return
 
 
 
@@ -434,7 +386,6 @@ def _run_job(job_id: str, req: RunRequest) -> None:
                 "zip_path": zip_path,
             }
         )
-        _write_meta(job_id, JOBS[job_id])
 
     except Exception as e:
         err = f"{type(e).__name__}: {str(e)}"
@@ -447,7 +398,6 @@ def _run_job(job_id: str, req: RunRequest) -> None:
                 "traceback": tb,
             }
         )
-        _write_meta(job_id, JOBS[job_id])
 
         # Always try to reclaim disk if a job fails (prevents repeated evictions).
         try:
@@ -473,24 +423,43 @@ def root_head():
 
 
 @app.post("/fmap/run", response_model=RunResponse)
-def run(req: RunRequest, background: BackgroundTasks):
+def run(req: RunRequest):
+    """Start a new FMAP job.
+
+    IMPORTANT: Do NOT use Starlette BackgroundTasks for the heavy pipeline; it runs in the same
+    request thread and can block the server (causing Render to return 502 during polling).
+    We submit the work to a background thread so /status stays responsive.
+    """
     _cleanup_old_jobs()
 
     job_id = uuid.uuid4().hex
-    JOBS[job_id] = {
+    job_dir = _job_dir(job_id)
+    os.makedirs(job_dir, exist_ok=True)
+
+    base = {
         "status": "queued",
-        "started_at": _utc_now(),
-        "started_epoch": time.time(),
-        "job_dir": _job_dir(job_id),
+        "started_at": None,
+        "finished_at": None,
+        "error": None,
+        "traceback": None,
+        "analysis": {},
+        "manifest": [],
+        "zip_path": None,
     }
 
-    background.add_task(_run_job, job_id, req)
+    with JOBS_LOCK:
+        JOBS[job_id] = base
+
+    _persist_job_meta(job_id)
+
+    # Run in background thread (keeps API responsive)
+    EXECUTOR.submit(_run_job, job_id, req)
 
     download_url = f"/fmap/download/{job_id}" if req.include_zip else None
     return RunResponse(
         job_id=job_id,
-        status=JOBS[job_id]["status"],
-        started_at=JOBS[job_id]["started_at"],
+        status="queued",
+        status_url=f"/fmap/status/{job_id}",
         result_url=f"/fmap/result/{job_id}",
         download_url=download_url,
     )
@@ -507,9 +476,7 @@ def run_sync(req: RunRequest):
         "started_at": _utc_now(),
         "started_epoch": time.time(),
         "job_dir": _job_dir(job_id),
-        "request": req.model_dump(),
     }
-    _write_meta(job_id, JOBS[job_id])
     _run_job(job_id, req)
 
     meta = JOBS.get(job_id)
@@ -533,9 +500,14 @@ def run_sync(req: RunRequest):
 
 @app.get("/fmap/status/{job_id}", response_model=StatusResponse)
 def status(job_id: str):
-    meta = _get_meta(job_id)
+    meta = JOBS.get(job_id)
     if not meta:
-        raise HTTPException(status_code=404, detail="Unknown job_id")
+        meta = _load_job_meta(job_id)
+        if meta:
+            with JOBS_LOCK:
+                JOBS[job_id] = meta
+        else:
+            raise HTTPException(status_code=404, detail="Unknown job_id")
     return StatusResponse(
         job_id=job_id,
         status=meta.get("status", "unknown"),
@@ -547,9 +519,14 @@ def status(job_id: str):
 
 @app.get("/fmap/result/{job_id}", response_model=ResultResponse)
 def result(job_id: str):
-    meta = _get_meta(job_id)
+    meta = JOBS.get(job_id)
     if not meta:
-        raise HTTPException(status_code=404, detail="Unknown job_id")
+        meta = _load_job_meta(job_id)
+        if meta:
+            with JOBS_LOCK:
+                JOBS[job_id] = meta
+        else:
+            raise HTTPException(status_code=404, detail="Unknown job_id")
 
     if meta.get("status") in ("queued", "running"):
         raise HTTPException(status_code=409, detail={"status": meta.get("status"), "message": "Not finished yet. Use /fmap/status."})
@@ -571,9 +548,14 @@ def result(job_id: str):
 
 @app.get("/fmap/download/{job_id}")
 def download(job_id: str):
-    meta = _get_meta(job_id)
+    meta = JOBS.get(job_id)
     if not meta:
-        raise HTTPException(status_code=404, detail="Unknown job_id")
+        meta = _load_job_meta(job_id)
+        if meta:
+            with JOBS_LOCK:
+                JOBS[job_id] = meta
+        else:
+            raise HTTPException(status_code=404, detail="Unknown job_id")
 
     zip_path = meta.get("zip_path")
     if not zip_path or not os.path.exists(zip_path):
