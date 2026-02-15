@@ -374,30 +374,19 @@ def _run_job(job_id: str, req: RunRequest) -> None:
                 "limit products, or run on an instance with persistent disk."
             )
 
+        # Forest/Fire summary analysis
         analysis = run_analysis(job_dir=job_dir, request=req.model_dump(), download_meta=download_meta)
-
-        # Persist analysis early (so /result works across workers)
         _write_json(_analysis_path(job_dir), analysis)
 
-
-        # --- Optional time-series products (point and/or region) ---
-        ts_warnings: List[str] = []
-        try:
-            if getattr(req, "selection", "point") == "region":
-                # Build an approximate region-mean climate series by sampling multiple points inside the bbox/geojson.
-                _compute_region_mean_timeseries(job_dir, req)
-        except Exception as e:
-            ts_warnings.append(f"Region time series generation failed: {e}")
-
+        # Optional time-series packaging (so the UI can draw charts)
         try:
             ts_info = _ensure_timeseries_jsons(job_dir, req)
-            if ts_warnings:
-                ts_info.setdefault("warnings", []).extend(ts_warnings)
             if isinstance(analysis, dict):
                 analysis["timeseries"] = ts_info
         except Exception as e:
             if isinstance(analysis, dict):
                 analysis["timeseries"] = {"available": False, "warnings": [f"Time series packaging failed: {e}"]}
+
         # Prune intermediates and (optionally) large rasters to keep temp storage under control.
         prune_report = _prune_job_dir(job_dir, keep_rasters=req.keep_rasters, keep_zip=req.include_zip)
         JOBS[job_id]["prune_report"] = prune_report
@@ -410,7 +399,6 @@ def _run_job(job_id: str, req: RunRequest) -> None:
 
         manifest = build_manifest(job_dir)
         _write_json(_manifest_path(job_dir), manifest)
-
 
         # Optionally build zip for user download (zipping duplicates bytes temporarily).
         zip_path = None
@@ -432,7 +420,6 @@ def _run_job(job_id: str, req: RunRequest) -> None:
                 "zip_path": zip_path,
             }
         )
-    _persist_meta(job_id, job_dir, JOBS[job_id])
 
     except Exception as e:
         err = f"{type(e).__name__}: {str(e)}"
@@ -446,12 +433,10 @@ def _run_job(job_id: str, req: RunRequest) -> None:
             }
         )
 
-        # Always try to reclaim disk        _persist_meta(job_id, job_dir, JOBS[job_id])
-
-         if a job fails (prevents repeated evictions).
+    finally:
+        # Persist job state so /status and /result can be served even across process restarts.
         try:
-            _safe_rmtree(job_dir)
-            JOBS[job_id]["job_dir_cleaned"] = True
+            _persist_meta(job_id, job_dir, JOBS[job_id])
         except Exception:
             pass
 
