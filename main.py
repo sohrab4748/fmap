@@ -14,6 +14,9 @@ import time
 import uuid
 import shutil
 import traceback
+import json
+import threading
+import glob
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, List, Literal, Tuple
 from fastapi import BackgroundTasks, FastAPI, HTTPException
@@ -51,52 +54,118 @@ if allow_creds and not origins:
     raise RuntimeError("FMAP_CORS_ORIGINS is required when FMAP_CORS_ALLOW_CREDENTIALS=true")
 
 
+# -------------------------
+# CORS
+# -------------------------
+# Set FMAP_CORS_ORIGINS in Render (comma-separated) to lock down origins, e.g.:
+#   https://fmap.agrimetsoft.com,http://localhost:5173
+# Or set it to "*" to allow all origins (not recommended for production).
+_cors_env = (os.getenv("FMAP_CORS_ORIGINS") or "https://fmap.agrimetsoft.com").strip()
+
+if _cors_env in {"*", "all", "ALL"}:
+    _allow_origins = ["*"]
+    _allow_origin_regex = None
+else:
+    _allow_origins = [o.strip() for o in _cors_env.split(",") if o.strip()]
+    # Optional: allow all agrimetsoft subdomains
+    _allow_origin_regex = (os.getenv("FMAP_CORS_ORIGIN_REGEX") or r"https://.*\.agrimetsoft\.com").strip() or None
+
 app.add_middleware(
     CORSMiddleware,
-    # Allow calls from any frontend origin (including file:// and custom domains).
-    # No cookies/credentials are used, so wildcard origins are safe here.
-    allow_origins=["*"],
+    allow_origins=_allow_origins,
+    allow_origin_regex=_allow_origin_regex,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
+    max_age=86400,
 )
 
 # Simple in-memory job store (sufficient for a single Render instance)
 JOBS: Dict[str, Dict[str, Any]] = {}
+# ----------------------------
+# Lightweight on-disk persistence
+# ----------------------------
+# Why: Render (and Gunicorn) may restart workers, and multiple workers can lead to
+# status polling hitting a different worker than the one that started the job.
+# We persist minimal job state in the job directory so /status and /result remain stable.
 
-import threading
-from concurrent.futures import ThreadPoolExecutor
+META_FILENAME = "job_meta.json"
+RESULT_FILENAME = "result.json"
 
-# Thread-safe job store + background executor (keeps API responsive during long runs)
-JOBS_LOCK = threading.Lock()
-EXECUTOR = ThreadPoolExecutor(max_workers=int(os.getenv('FMAP_MAX_WORKERS', '1')))
 
-def _job_meta_path(job_id: str) -> str:
-    return os.path.join(_job_dir(job_id), 'job_meta.json')
+def _meta_path(job_id: str) -> str:
+    return os.path.join(_job_dir(job_id), META_FILENAME)
 
-def _persist_job_meta(job_id: str) -> None:
-    """Persist JOBS[job_id] to disk so status/result survive process restarts."""
+
+def _result_path(job_id: str) -> str:
+    return os.path.join(_job_dir(job_id), RESULT_FILENAME)
+
+
+def _safe_write_json(path: str, payload: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
+    os.replace(tmp, path)
+
+
+def _load_json(path: str) -> Optional[Dict[str, Any]]:
     try:
-        with JOBS_LOCK:
-            meta = JOBS.get(job_id)
-            if not meta:
-                return
-            # Ensure JSON-serializable
-            safe = json.loads(json.dumps(meta, default=str))
-        os.makedirs(_job_dir(job_id), exist_ok=True)
-        with open(_job_meta_path(job_id), 'w', encoding='utf-8') as f:
-            json.dump(safe, f, indent=2)
-    except Exception:
-        # Never crash the API because persistence failed
-        return
-
-def _load_job_meta(job_id: str) -> Optional[Dict[str, Any]]:
-    p = _job_meta_path(job_id)
-    if not os.path.exists(p):
-        return None
-    try:
-        with open(p, 'r', encoding='utf-8') as f:
+        if not os.path.exists(path):
+            return None
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
+    except Exception:
+        return None
+
+
+def _persist_meta(job_id: str) -> None:
+    meta = JOBS.get(job_id)
+    if not meta:
+        return
+    # Keep meta small/stable
+    payload = {
+        "job_id": job_id,
+        "status": meta.get("status", "unknown"),
+        "started_at": meta.get("started_at"),
+        "finished_at": meta.get("finished_at"),
+        "error": meta.get("error"),
+        "traceback": meta.get("traceback"),
+        "job_dir": meta.get("job_dir") or _job_dir(job_id),
+        "zip_path": meta.get("zip_path"),
+        "request": meta.get("request"),
+    }
+    _safe_write_json(_meta_path(job_id), payload)
+
+
+def _persist_result(job_id: str, analysis: Dict[str, Any], manifest: Dict[str, Any]) -> None:
+    meta = JOBS.get(job_id) or {}
+    payload = {
+        "job_id": job_id,
+        "status": meta.get("status", "done"),
+        "started_at": meta.get("started_at"),
+        "finished_at": meta.get("finished_at"),
+        "analysis": analysis or {},
+        "manifest": manifest or {},
+        "download_url": f"/fmap/download/{job_id}" if meta.get("zip_path") else None,
+    }
+    _safe_write_json(_result_path(job_id), payload)
+
+
+def _load_meta(job_id: str) -> Optional[Dict[str, Any]]:
+    return _load_json(_meta_path(job_id))
+
+
+def _load_result(job_id: str) -> Optional[Dict[str, Any]]:
+    return _load_json(_result_path(job_id))
+
+
+def _find_zip_in_job_dir(job_id: str) -> Optional[str]:
+    job_dir = _job_dir(job_id)
+    try:
+        zips = glob.glob(os.path.join(job_dir, "*.zip"))
+        return zips[0] if zips else None
     except Exception:
         return None
 
@@ -311,6 +380,8 @@ def _run_job(job_id: str, req: RunRequest) -> None:
         }
     )
 
+    _persist_meta(job_id)
+
     try:
         download_meta = run_download_pipeline(
             job_dir=job_dir,
@@ -387,6 +458,12 @@ def _run_job(job_id: str, req: RunRequest) -> None:
             }
         )
 
+        try:
+            _persist_meta(job_id)
+            _persist_result(job_id, analysis=analysis if isinstance(analysis, dict) else {}, manifest=manifest)
+        except Exception:
+            pass
+
     except Exception as e:
         err = f"{type(e).__name__}: {str(e)}"
         tb = traceback.format_exc(limit=10)
@@ -398,6 +475,11 @@ def _run_job(job_id: str, req: RunRequest) -> None:
                 "traceback": tb,
             }
         )
+
+        try:
+            _persist_meta(job_id)
+        except Exception:
+            pass
 
         # Always try to reclaim disk if a job fails (prevents repeated evictions).
         try:
@@ -423,43 +505,34 @@ def root_head():
 
 
 @app.post("/fmap/run", response_model=RunResponse)
-def run(req: RunRequest):
-    """Start a new FMAP job.
-
-    IMPORTANT: Do NOT use Starlette BackgroundTasks for the heavy pipeline; it runs in the same
-    request thread and can block the server (causing Render to return 502 during polling).
-    We submit the work to a background thread so /status stays responsive.
-    """
+def run(req: RunRequest, background: BackgroundTasks):
     _cleanup_old_jobs()
 
     job_id = uuid.uuid4().hex
-    job_dir = _job_dir(job_id)
-    os.makedirs(job_dir, exist_ok=True)
-
-    base = {
+    JOBS[job_id] = {
         "status": "queued",
-        "started_at": None,
-        "finished_at": None,
-        "error": None,
-        "traceback": None,
-        "analysis": {},
-        "manifest": [],
-        "zip_path": None,
+        "started_at": _utc_now(),
+        "started_epoch": time.time(),
+        "job_dir": _job_dir(job_id),
     }
 
-    with JOBS_LOCK:
-        JOBS[job_id] = base
+    # Persist immediately so status polling works across workers/restarts
+    try:
+        JOBS[job_id]["request"] = req.model_dump()
+        os.makedirs(JOBS[job_id]["job_dir"], exist_ok=True)
+        _persist_meta(job_id)
+    except Exception:
+        pass
 
-    _persist_job_meta(job_id)
-
-    # Run in background thread (keeps API responsive)
-    EXECUTOR.submit(_run_job, job_id, req)
+    # Run heavy work in a daemon thread so the API remains responsive during processing
+    t = threading.Thread(target=_run_job, args=(job_id, req), daemon=True)
+    t.start()
 
     download_url = f"/fmap/download/{job_id}" if req.include_zip else None
     return RunResponse(
         job_id=job_id,
-        status="queued",
-        status_url=f"/fmap/status/{job_id}",
+        status=JOBS[job_id]["status"],
+        started_at=JOBS[job_id]["started_at"],
         result_url=f"/fmap/result/{job_id}",
         download_url=download_url,
     )
@@ -477,6 +550,13 @@ def run_sync(req: RunRequest):
         "started_epoch": time.time(),
         "job_dir": _job_dir(job_id),
     }
+
+    try:
+        JOBS[job_id]["request"] = req.model_dump()
+        os.makedirs(JOBS[job_id]["job_dir"], exist_ok=True)
+        _persist_meta(job_id)
+    except Exception:
+        pass
     _run_job(job_id, req)
 
     meta = JOBS.get(job_id)
@@ -499,15 +579,15 @@ def run_sync(req: RunRequest):
 
 
 @app.get("/fmap/status/{job_id}", response_model=StatusResponse)
+
 def status(job_id: str):
     meta = JOBS.get(job_id)
     if not meta:
-        meta = _load_job_meta(job_id)
-        if meta:
-            with JOBS_LOCK:
-                JOBS[job_id] = meta
-        else:
+        disk = _load_meta(job_id)
+        if not disk:
             raise HTTPException(status_code=404, detail="Unknown job_id")
+        # Cache a minimal in-memory view (optional)
+        meta = disk
     return StatusResponse(
         job_id=job_id,
         status=meta.get("status", "unknown"),
@@ -516,17 +596,32 @@ def status(job_id: str):
         error=meta.get("error"),
     )
 
-
 @app.get("/fmap/result/{job_id}", response_model=ResultResponse)
+
 def result(job_id: str):
     meta = JOBS.get(job_id)
     if not meta:
-        meta = _load_job_meta(job_id)
-        if meta:
-            with JOBS_LOCK:
-                JOBS[job_id] = meta
-        else:
+        # Prefer the persisted result if available
+        persisted = _load_result(job_id)
+        if persisted:
+            if persisted.get("status") in ("queued", "running"):
+                raise HTTPException(status_code=409, detail={"status": persisted.get("status"), "message": "Not finished yet. Use /fmap/status."})
+            if persisted.get("status") == "error":
+                raise HTTPException(status_code=500, detail={"error": persisted.get("error"), "traceback": persisted.get("traceback")})
+            return ResultResponse(
+                job_id=job_id,
+                status=persisted.get("status", "done"),
+                started_at=persisted.get("started_at"),
+                finished_at=persisted.get("finished_at") or _utc_now(),
+                analysis=persisted.get("analysis") or {},
+                manifest=persisted.get("manifest") or {},
+                download_url=persisted.get("download_url"),
+            )
+
+        disk = _load_meta(job_id)
+        if not disk:
             raise HTTPException(status_code=404, detail="Unknown job_id")
+        meta = disk
 
     if meta.get("status") in ("queued", "running"):
         raise HTTPException(status_code=409, detail={"status": meta.get("status"), "message": "Not finished yet. Use /fmap/status."})
@@ -534,35 +629,43 @@ def result(job_id: str):
     if meta.get("status") == "error":
         raise HTTPException(status_code=500, detail={"error": meta.get("error"), "traceback": meta.get("traceback")})
 
+    # If we have a persisted result, return it (it contains full analysis/manifest)
+    persisted = _load_result(job_id)
+    if persisted and persisted.get("analysis") is not None and persisted.get("manifest") is not None:
+        download_url = persisted.get("download_url")
+        return ResultResponse(
+            job_id=job_id,
+            status=persisted.get("status", meta.get("status", "done")),
+            started_at=persisted.get("started_at") or meta.get("started_at"),
+            finished_at=persisted.get("finished_at") or meta.get("finished_at") or _utc_now(),
+            analysis=persisted.get("analysis") or {},
+            manifest=persisted.get("manifest") or {},
+            download_url=download_url,
+        )
+
     download_url = f"/fmap/download/{job_id}" if meta.get("zip_path") else None
     return ResultResponse(
         job_id=job_id,
         status=meta["status"],
         started_at=meta["started_at"],
         finished_at=meta["finished_at"],
-        analysis=meta["analysis"],
-        manifest=meta["manifest"],
+        analysis=meta.get("analysis") or {},
+        manifest=meta.get("manifest") or {},
         download_url=download_url,
     )
 
-
 @app.get("/fmap/download/{job_id}")
-def download(job_id: str):
-    meta = JOBS.get(job_id)
-    if not meta:
-        meta = _load_job_meta(job_id)
-        if meta:
-            with JOBS_LOCK:
-                JOBS[job_id] = meta
-        else:
-            raise HTTPException(status_code=404, detail="Unknown job_id")
 
-    zip_path = meta.get("zip_path")
+def download(job_id: str):
+    meta = JOBS.get(job_id) or _load_meta(job_id) or _load_result(job_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Unknown job_id")
+
+    zip_path = meta.get("zip_path") or _find_zip_in_job_dir(job_id)
     if not zip_path or not os.path.exists(zip_path):
         raise HTTPException(status_code=404, detail="ZIP not available for this job (run with include_zip=true).")
 
     return FileResponse(zip_path, media_type="application/zip", filename=os.path.basename(zip_path))
-
 
 # ----------------------------
 # Time series helpers / API
@@ -843,22 +946,16 @@ def _compute_region_mean_timeseries(job_dir: str, req: RunRequest) -> None:
 
     merged: Optional[pd.DataFrame] = None
 
-    for dataset_id, var_candidates in GRIDMET_DATASETS.items():
+    for _key, info in GRIDMET_DATASETS.items():
+        dataset_id = info.get("dataset_id", _key)
+        var_candidates = info.get("vars", [])
         per_var: Optional[pd.DataFrame] = None
         ok_points = 0
 
         for i, (lon, lat) in enumerate(points):
             out_csv = os.path.join(sample_dir, f"{dataset_id}_p{i+1}.csv")
             try:
-                _, df_pt, _used_var = ncss_point_csv(
-                    dataset_id=dataset_id,
-                    var_candidates=var_candidates,
-                    lon=lon,
-                    lat=lat,
-                    start_date=start_date,
-                    end_date=end_date,
-                    out_csv=out_csv,
-                )
+                _, df_pt, _used_var = ncss_point_csv(dataset_id, var_candidates, lon, lat, start_date, end_date, out_csv)
                 vc = [c for c in df_pt.columns if c != "time"]
                 if not vc:
                     continue
@@ -889,7 +986,7 @@ def _compute_region_mean_timeseries(job_dir: str, req: RunRequest) -> None:
     if "pr" in merged.columns:
         pr = pd.to_numeric(merged["pr"], errors="coerce")
         pr_series = pd.Series(pr.values, index=pd.to_datetime(merged["time"]))
-        spi = spi_gamma_monthly(pr_series, scale_days=30)
+        spi = spi_gamma_monthly(pr_series, window=30)
         spi_df = pd.DataFrame({"time": spi.index, "spi30": spi.values})
         spi_df["time"] = pd.to_datetime(spi_df["time"], utc=True).dt.tz_convert(None)
         out_spi = os.path.join(job_dir, "spi30_region.csv")
