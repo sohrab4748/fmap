@@ -631,83 +631,83 @@ def run_download_pipeline(
     # -------------------------
     # 1) Landsat vegetation indices
     # -------------------------
-# Landsat is optional. If not available, we continue with the rest of the forest pipeline
-# (NLCD, FIA biomass/carbon, MTBS, WFIGS, etc.).
-if include_landsat:
-    catalog = _stac_client()
-
-    def _landsat_items(dt0: str, dt1: str, use_cloud: bool) -> List:
-        kwargs = dict(
-            collections=["landsat-c2-l2"],
-            bbox=list(bbox_lonlat),
-            datetime=f"{dt0}/{dt1}",
-        )
-        if use_cloud:
-            kwargs["query"] = {"eo:cloud_cover": {"lt": cloud_cover_lt}}
-        return list(catalog.search(**kwargs).items())
-
-    items = _landsat_items(date_start, date_end, use_cloud=True)
-
-    # Fallback 1: relax the cloud-cover filter (some items may miss cloud metadata)
-    if not items and landsat_relax_cloud:
-        items = _landsat_items(date_start, date_end, use_cloud=False)
-
-    # Fallback 2: expand the search window around the requested dates
-    if not items and landsat_expand_days and landsat_expand_days > 0:
-        try:
-            import datetime as _dt
-            d0 = pd.to_datetime(date_start).date()
-            d1 = pd.to_datetime(date_end).date()
-            dt0 = (d0 - _dt.timedelta(days=int(landsat_expand_days))).isoformat()
-            dt1 = (d1 + _dt.timedelta(days=int(landsat_expand_days))).isoformat()
-            items = _landsat_items(dt0, dt1, use_cloud=not landsat_relax_cloud)
-        except Exception:
-            pass
-
-    if not items:
-        meta["landsat_found"] = False
-        meta["landsat_error"] = "No Landsat scenes found for the requested window (or expanded search)."
+    # Landsat is optional. If not available, we continue with the rest of the forest pipeline
+    # (NLCD, FIA biomass/carbon, MTBS, WFIGS, etc.).
+    if include_landsat:
+        catalog = _stac_client()
+    
+        def _landsat_items(dt0: str, dt1: str, use_cloud: bool) -> List:
+            kwargs = dict(
+                collections=["landsat-c2-l2"],
+                bbox=list(bbox_lonlat),
+                datetime=f"{dt0}/{dt1}",
+            )
+            if use_cloud:
+                kwargs["query"] = {"eo:cloud_cover": {"lt": cloud_cover_lt}}
+            return list(catalog.search(**kwargs).items())
+    
+        items = _landsat_items(date_start, date_end, use_cloud=True)
+    
+        # Fallback 1: relax the cloud-cover filter (some items may miss cloud metadata)
+        if not items and landsat_relax_cloud:
+            items = _landsat_items(date_start, date_end, use_cloud=False)
+    
+        # Fallback 2: expand the search window around the requested dates
+        if not items and landsat_expand_days and landsat_expand_days > 0:
+            try:
+                import datetime as _dt
+                d0 = pd.to_datetime(date_start).date()
+                d1 = pd.to_datetime(date_end).date()
+                dt0 = (d0 - _dt.timedelta(days=int(landsat_expand_days))).isoformat()
+                dt1 = (d1 + _dt.timedelta(days=int(landsat_expand_days))).isoformat()
+                items = _landsat_items(dt0, dt1, use_cloud=not landsat_relax_cloud)
+            except Exception:
+                pass
+    
+        if not items:
+            meta["landsat_found"] = False
+            meta["landsat_error"] = "No Landsat scenes found for the requested window (or expanded search)."
+        else:
+            meta["landsat_found"] = True
+            item = sorted(items, key=lambda it: it.properties.get("eo:cloud_cover", 999))[0]
+            meta["landsat_item_id"] = item.id
+            meta["landsat_cloud_cover"] = float(item.properties.get("eo:cloud_cover", np.nan))
+    
+            red_key   = pick_asset_key(item, ["red", "SR_B4", "B04"])
+            nir_key   = pick_asset_key(item, ["nir08", "SR_B5", "B08"])
+            swir1_key = pick_asset_key(item, ["swir16", "SR_B6", "B11"])
+            swir2_key = pick_asset_key(item, ["swir22", "SR_B7", "B12"])
+    
+            red, landsat_prof, _   = read_cog_subset(item.assets[red_key].href,   bbox_lonlat=bbox_lonlat)
+            nir, _, _              = read_cog_subset(item.assets[nir_key].href,   bbox_lonlat=bbox_lonlat)
+            swir1, _, _            = read_cog_subset(item.assets[swir1_key].href, bbox_lonlat=bbox_lonlat)
+            swir2, _, _            = read_cog_subset(item.assets[swir2_key].href, bbox_lonlat=bbox_lonlat)
+    
+            red_f   = apply_stac_scale_offset(item, red_key, red)
+            nir_f   = apply_stac_scale_offset(item, nir_key, nir)
+            swir1_f = apply_stac_scale_offset(item, swir1_key, swir1)
+            swir2_f = apply_stac_scale_offset(item, swir2_key, swir2)
+    
+            ndvi = (nir_f - red_f) / (nir_f + red_f + 1e-6)
+            ndmi = (nir_f - swir1_f) / (nir_f + swir1_f + 1e-6)
+            nbr  = (nir_f - swir2_f) / (nir_f + swir2_f + 1e-6)
+    
+            ndvi_path = os.path.join(job_dir, "ndvi_bbox.tif")
+            ndmi_path = os.path.join(job_dir, "ndmi_bbox.tif")
+            nbr_path  = os.path.join(job_dir, "nbr_bbox.tif")
+            write_geotiff(ndvi_path, ndvi, landsat_prof, dtype="float32")
+            write_geotiff(ndmi_path, ndmi, landsat_prof, dtype="float32")
+            write_geotiff(nbr_path,  nbr,  landsat_prof, dtype="float32")
+    
+            meta["ndvi_mean_bbox"] = float(np.nanmean(ndvi))
+            meta["ndmi_mean_bbox"] = float(np.nanmean(ndmi))
+            meta["nbr_mean_bbox"]  = float(np.nanmean(nbr))
+            meta["ndvi_point"] = float(sample_raster_point(ndvi_path, pt_lon, pt_lat))
+            meta["ndmi_point"] = float(sample_raster_point(ndmi_path, pt_lon, pt_lat))
+            meta["nbr_point"]  = float(sample_raster_point(nbr_path,  pt_lon, pt_lat))
     else:
-        meta["landsat_found"] = True
-        item = sorted(items, key=lambda it: it.properties.get("eo:cloud_cover", 999))[0]
-        meta["landsat_item_id"] = item.id
-        meta["landsat_cloud_cover"] = float(item.properties.get("eo:cloud_cover", np.nan))
-
-        red_key   = pick_asset_key(item, ["red", "SR_B4", "B04"])
-        nir_key   = pick_asset_key(item, ["nir08", "SR_B5", "B08"])
-        swir1_key = pick_asset_key(item, ["swir16", "SR_B6", "B11"])
-        swir2_key = pick_asset_key(item, ["swir22", "SR_B7", "B12"])
-
-        red, landsat_prof, _   = read_cog_subset(item.assets[red_key].href,   bbox_lonlat=bbox_lonlat)
-        nir, _, _              = read_cog_subset(item.assets[nir_key].href,   bbox_lonlat=bbox_lonlat)
-        swir1, _, _            = read_cog_subset(item.assets[swir1_key].href, bbox_lonlat=bbox_lonlat)
-        swir2, _, _            = read_cog_subset(item.assets[swir2_key].href, bbox_lonlat=bbox_lonlat)
-
-        red_f   = apply_stac_scale_offset(item, red_key, red)
-        nir_f   = apply_stac_scale_offset(item, nir_key, nir)
-        swir1_f = apply_stac_scale_offset(item, swir1_key, swir1)
-        swir2_f = apply_stac_scale_offset(item, swir2_key, swir2)
-
-        ndvi = (nir_f - red_f) / (nir_f + red_f + 1e-6)
-        ndmi = (nir_f - swir1_f) / (nir_f + swir1_f + 1e-6)
-        nbr  = (nir_f - swir2_f) / (nir_f + swir2_f + 1e-6)
-
-        ndvi_path = os.path.join(job_dir, "ndvi_bbox.tif")
-        ndmi_path = os.path.join(job_dir, "ndmi_bbox.tif")
-        nbr_path  = os.path.join(job_dir, "nbr_bbox.tif")
-        write_geotiff(ndvi_path, ndvi, landsat_prof, dtype="float32")
-        write_geotiff(ndmi_path, ndmi, landsat_prof, dtype="float32")
-        write_geotiff(nbr_path,  nbr,  landsat_prof, dtype="float32")
-
-        meta["ndvi_mean_bbox"] = float(np.nanmean(ndvi))
-        meta["ndmi_mean_bbox"] = float(np.nanmean(ndmi))
-        meta["nbr_mean_bbox"]  = float(np.nanmean(nbr))
-        meta["ndvi_point"] = float(sample_raster_point(ndvi_path, pt_lon, pt_lat))
-        meta["ndmi_point"] = float(sample_raster_point(ndmi_path, pt_lon, pt_lat))
-        meta["nbr_point"]  = float(sample_raster_point(nbr_path,  pt_lon, pt_lat))
-else:
-    meta["landsat_found"] = False
-    meta["landsat_skipped"] = True
+        meta["landsat_found"] = False
+        meta["landsat_skipped"] = True
 
 
     # -------------------------
