@@ -14,9 +14,10 @@ import time
 import uuid
 import shutil
 import traceback
+import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, List, Literal, Tuple
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field, model_validator
@@ -457,7 +458,7 @@ def root_head():
 
 
 @app.post("/fmap/run", response_model=RunResponse)
-def run(req: RunRequest, background: BackgroundTasks):
+def run(req: RunRequest):
     _cleanup_old_jobs()
 
     job_id = uuid.uuid4().hex
@@ -470,7 +471,8 @@ def run(req: RunRequest, background: BackgroundTasks):
     os.makedirs(_job_dir(job_id), exist_ok=True)
     _persist_meta(job_id, _job_dir(job_id), JOBS[job_id])
 
-    background.add_task(_run_job, job_id, req)
+    # Run the heavy job in a daemon thread so the API stays responsive.
+    threading.Thread(target=_run_job, args=(job_id, req), daemon=True).start()
 
     download_url = f"/fmap/download/{job_id}" if req.include_zip else None
     return RunResponse(
