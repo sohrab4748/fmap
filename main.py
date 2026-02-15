@@ -62,8 +62,79 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# Force CORS headers even on error responses (helps when reverse proxies strip headers)
+@app.middleware("http")
+async def _force_cors_headers(request, call_next):
+    try:
+        response = await call_next(request)
+    except Exception as e:
+        # Let FastAPI's exception handlers run
+        raise
+    # If CORSMiddleware already set these, this is harmless.
+    response.headers.setdefault("Access-Control-Allow-Origin", "*")
+    response.headers.setdefault("Access-Control-Allow-Methods", "*")
+    response.headers.setdefault("Access-Control-Allow-Headers", "*")
+    return response
+
 # Simple in-memory job store (sufficient for a single Render instance)
 JOBS: Dict[str, Dict[str, Any]] = {}
+
+
+# ----------------------------
+# Disk-backed job state (handles multi-worker + restarts)
+# ----------------------------
+def _job_meta_path(job_dir: str) -> str:
+    return os.path.join(job_dir, "job_meta.json")
+
+def _analysis_path(job_dir: str) -> str:
+    return os.path.join(job_dir, "analysis.json")
+
+def _manifest_path(job_dir: str) -> str:
+    return os.path.join(job_dir, "manifest.json")
+
+def _write_json(path: str, obj: Any) -> None:
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2, default=str)
+    except Exception:
+        pass
+
+def _read_json(path: str) -> Optional[Dict[str, Any]]:
+    try:
+        if not os.path.exists(path):
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def _persist_meta(job_id: str, job_dir: str, meta: Dict[str, Any]) -> None:
+    # Store a minimal meta payload (safe to read from any worker)
+    payload = {
+        "job_id": job_id,
+        "status": meta.get("status"),
+        "started_at": meta.get("started_at"),
+        "finished_at": meta.get("finished_at"),
+        "error": meta.get("error"),
+        "zip_path": meta.get("zip_path"),
+    }
+    _write_json(_job_meta_path(job_dir), payload)
+
+def _load_meta_from_disk(job_id: str) -> Optional[Dict[str, Any]]:
+    job_dir = _job_dir(job_id)
+    meta = _read_json(_job_meta_path(job_dir))
+    if not meta:
+        return None
+    # Normalize and attach job_dir
+    meta["job_dir"] = job_dir
+    return meta
+
+def _load_analysis_manifest_from_disk(job_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    job_dir = _job_dir(job_id)
+    a = _read_json(_analysis_path(job_dir))
+    m = _read_json(_manifest_path(job_dir))
+    return a, m
 
 
 def _utc_now() -> str:
@@ -274,6 +345,7 @@ def _run_job(job_id: str, req: RunRequest) -> None:
             "started_epoch": time.time(),
         }
     )
+    _persist_meta(job_id, job_dir, JOBS[job_id])
 
     try:
         # Lazy imports: keep startup fast (important for Render port scan)
@@ -304,6 +376,10 @@ def _run_job(job_id: str, req: RunRequest) -> None:
 
         analysis = run_analysis(job_dir=job_dir, request=req.model_dump(), download_meta=download_meta)
 
+        # Persist analysis early (so /result works across workers)
+        _write_json(_analysis_path(job_dir), analysis)
+
+
         # --- Optional time-series products (point and/or region) ---
         ts_warnings: List[str] = []
         try:
@@ -333,6 +409,8 @@ def _run_job(job_id: str, req: RunRequest) -> None:
             )
 
         manifest = build_manifest(job_dir)
+        _write_json(_manifest_path(job_dir), manifest)
+
 
         # Optionally build zip for user download (zipping duplicates bytes temporarily).
         zip_path = None
@@ -354,6 +432,7 @@ def _run_job(job_id: str, req: RunRequest) -> None:
                 "zip_path": zip_path,
             }
         )
+    _persist_meta(job_id, job_dir, JOBS[job_id])
 
     except Exception as e:
         err = f"{type(e).__name__}: {str(e)}"
@@ -367,7 +446,9 @@ def _run_job(job_id: str, req: RunRequest) -> None:
             }
         )
 
-        # Always try to reclaim disk if a job fails (prevents repeated evictions).
+        # Always try to reclaim disk        _persist_meta(job_id, job_dir, JOBS[job_id])
+
+         if a job fails (prevents repeated evictions).
         try:
             _safe_rmtree(job_dir)
             JOBS[job_id]["job_dir_cleaned"] = True
@@ -401,6 +482,8 @@ def run(req: RunRequest, background: BackgroundTasks):
         "started_epoch": time.time(),
         "job_dir": _job_dir(job_id),
     }
+    os.makedirs(_job_dir(job_id), exist_ok=True)
+    _persist_meta(job_id, _job_dir(job_id), JOBS[job_id])
 
     background.add_task(_run_job, job_id, req)
 
@@ -434,6 +517,13 @@ def run_sync(req: RunRequest):
 
     if meta["status"] == "error":
         raise HTTPException(status_code=500, detail={"error": meta.get("error"), "traceback": meta.get("traceback")})
+    # If we loaded meta from disk, analysis/manifest may not be in memory.
+    if "analysis" not in meta or "manifest" not in meta:
+        a, m = _load_analysis_manifest_from_disk(job_id)
+        if a is not None:
+            meta["analysis"] = a
+        if m is not None:
+            meta["manifest"] = m
 
     download_url = f"/fmap/download/{job_id}" if meta.get("zip_path") else None
     return ResultResponse(
@@ -451,7 +541,10 @@ def run_sync(req: RunRequest):
 def status(job_id: str):
     meta = JOBS.get(job_id)
     if not meta:
-        raise HTTPException(status_code=404, detail="Unknown job_id")
+        meta = _load_meta_from_disk(job_id)
+        if not meta:
+            raise HTTPException(status_code=404, detail="Unknown job_id")
+    
     return StatusResponse(
         job_id=job_id,
         status=meta.get("status", "unknown"),
@@ -465,7 +558,10 @@ def status(job_id: str):
 def result(job_id: str):
     meta = JOBS.get(job_id)
     if not meta:
-        raise HTTPException(status_code=404, detail="Unknown job_id")
+        meta = _load_meta_from_disk(job_id)
+        if not meta:
+            raise HTTPException(status_code=404, detail="Unknown job_id")
+    
 
     if meta.get("status") in ("queued", "running"):
         raise HTTPException(status_code=409, detail={"status": meta.get("status"), "message": "Not finished yet. Use /fmap/status."})
@@ -489,7 +585,10 @@ def result(job_id: str):
 def download(job_id: str):
     meta = JOBS.get(job_id)
     if not meta:
-        raise HTTPException(status_code=404, detail="Unknown job_id")
+        meta = _load_meta_from_disk(job_id)
+        if not meta:
+            raise HTTPException(status_code=404, detail="Unknown job_id")
+
 
     zip_path = meta.get("zip_path")
     if not zip_path or not os.path.exists(zip_path):
