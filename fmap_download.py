@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import datetime
 import re
 import xml.etree.ElementTree as ET
 from functools import lru_cache
@@ -611,8 +612,6 @@ def run_download_pipeline(
     spi_start: str,
     cloud_cover_lt: float = 30.0,
     size_px: int = 900,
-    include_landsat: bool = False,
-    landsat_max_items: int = 50,
 ) -> Dict[str, Union[str, float, int, None]]:
     """Run the full download pipeline and return a metadata dict."""
 
@@ -626,89 +625,73 @@ def run_download_pipeline(
         "date_end": date_end,
         "spi_start": spi_start,
     }
-    meta["include_landsat"] = bool(include_landsat)
+
+    # Validate ISO dates early (prevents downstream silent failures)
+    def _check_iso_date(name: str, val: str) -> datetime.date:
+        try:
+            d = datetime.date.fromisoformat(str(val))
+        except Exception:
+            raise ValueError(f"{name} must be ISO format YYYY-MM-DD (got {val!r})")
+        if d.year < 1900 or d.year > 2100:
+            raise ValueError(f"{name} year must be between 1900 and 2100 (got {val!r})")
+        return d
+
+    d_start = _check_iso_date("date_start", date_start)
+    d_end   = _check_iso_date("date_end", date_end)
+    _check_iso_date("spi_start", spi_start)
+
+    if d_end < d_start:
+        raise ValueError(f"date_end must be >= date_start (got {date_start} .. {date_end})")
 
     # -------------------------
     # 1) Landsat vegetation indices
     # -------------------------
-    # NOTE: Landsat step is optional. Default include_landsat=False for faster/safer runs on small instances.
-    landsat_prof = None
-    ndvi = ndmi = nbr = None
-    if include_landsat:
-        try:
-            catalog = _stac_client()
-            search = catalog.search(
-                collections=["landsat-c2-l2"],
-                bbox=list(bbox_lonlat),
-                datetime=f"{date_start}/{date_end}",
-                query={"eo:cloud_cover": {"lt": cloud_cover_lt}},
-            )
-            items = []
-            for _k, _it in enumerate(search.items()):
-                items.append(_it)
-                if landsat_max_items and (_k + 1) >= int(landsat_max_items):
-                    break
-            if not items:
-                raise RuntimeError("No Landsat scenes found. Try wider date range or larger bbox.")
-            item = sorted(items, key=lambda it: it.properties.get("eo:cloud_cover", 999))[0]
-            meta["landsat_item_id"] = item.id
-            meta["landsat_cloud_cover"] = float(item.properties.get("eo:cloud_cover", np.nan))
+    catalog = _stac_client()
+    search = catalog.search(
+        collections=["landsat-c2-l2"],
+        bbox=list(bbox_lonlat),
+        datetime=f"{date_start}/{date_end}",
+        query={"eo:cloud_cover": {"lt": cloud_cover_lt}},
+    )
+    items = list(search.items())
+    if not items:
+        raise RuntimeError("No Landsat scenes found. Try wider date range or larger bbox.")
+    item = sorted(items, key=lambda it: it.properties.get("eo:cloud_cover", 999))[0]
+    meta["landsat_item_id"] = item.id
+    meta["landsat_cloud_cover"] = float(item.properties.get("eo:cloud_cover", np.nan))
 
-            red_key   = pick_asset_key(item, ["red", "SR_B4", "B04"])
-            nir_key   = pick_asset_key(item, ["nir08", "SR_B5", "B08"])
-            swir1_key = pick_asset_key(item, ["swir16", "SR_B6", "B11"])
-            swir2_key = pick_asset_key(item, ["swir22", "SR_B7", "B12"])
+    red_key   = pick_asset_key(item, ["red", "SR_B4", "B04"])
+    nir_key   = pick_asset_key(item, ["nir08", "SR_B5", "B08"])
+    swir1_key = pick_asset_key(item, ["swir16", "SR_B6", "B11"])
+    swir2_key = pick_asset_key(item, ["swir22", "SR_B7", "B12"])
 
-            red, landsat_prof, _   = read_cog_subset(item.assets[red_key].href,   bbox_lonlat=bbox_lonlat)
-            nir, _, _              = read_cog_subset(item.assets[nir_key].href,   bbox_lonlat=bbox_lonlat)
-            swir1, _, _            = read_cog_subset(item.assets[swir1_key].href, bbox_lonlat=bbox_lonlat)
-            swir2, _, _            = read_cog_subset(item.assets[swir2_key].href, bbox_lonlat=bbox_lonlat)
+    red, landsat_prof, _   = read_cog_subset(item.assets[red_key].href,   bbox_lonlat=bbox_lonlat)
+    nir, _, _              = read_cog_subset(item.assets[nir_key].href,   bbox_lonlat=bbox_lonlat)
+    swir1, _, _            = read_cog_subset(item.assets[swir1_key].href, bbox_lonlat=bbox_lonlat)
+    swir2, _, _            = read_cog_subset(item.assets[swir2_key].href, bbox_lonlat=bbox_lonlat)
 
-            red_f   = apply_stac_scale_offset(item, red_key, red)
-            nir_f   = apply_stac_scale_offset(item, nir_key, nir)
-            swir1_f = apply_stac_scale_offset(item, swir1_key, swir1)
-            swir2_f = apply_stac_scale_offset(item, swir2_key, swir2)
+    red_f   = apply_stac_scale_offset(item, red_key, red)
+    nir_f   = apply_stac_scale_offset(item, nir_key, nir)
+    swir1_f = apply_stac_scale_offset(item, swir1_key, swir1)
+    swir2_f = apply_stac_scale_offset(item, swir2_key, swir2)
 
-            ndvi = (nir_f - red_f) / (nir_f + red_f + 1e-6)
-            ndmi = (nir_f - swir1_f) / (nir_f + swir1_f + 1e-6)
-            nbr  = (nir_f - swir2_f) / (nir_f + swir2_f + 1e-6)
+    ndvi = (nir_f - red_f) / (nir_f + red_f + 1e-6)
+    ndmi = (nir_f - swir1_f) / (nir_f + swir1_f + 1e-6)
+    nbr  = (nir_f - swir2_f) / (nir_f + swir2_f + 1e-6)
 
-            ndvi_path = os.path.join(job_dir, "ndvi_bbox.tif")
-            ndmi_path = os.path.join(job_dir, "ndmi_bbox.tif")
-            nbr_path  = os.path.join(job_dir, "nbr_bbox.tif")
-            write_geotiff(ndvi_path, ndvi, landsat_prof, dtype="float32")
-            write_geotiff(ndmi_path, ndmi, landsat_prof, dtype="float32")
-            write_geotiff(nbr_path,  nbr,  landsat_prof, dtype="float32")
+    ndvi_path = os.path.join(job_dir, "ndvi_bbox.tif")
+    ndmi_path = os.path.join(job_dir, "ndmi_bbox.tif")
+    nbr_path  = os.path.join(job_dir, "nbr_bbox.tif")
+    write_geotiff(ndvi_path, ndvi, landsat_prof, dtype="float32")
+    write_geotiff(ndmi_path, ndmi, landsat_prof, dtype="float32")
+    write_geotiff(nbr_path,  nbr,  landsat_prof, dtype="float32")
 
-            meta["ndvi_mean_bbox"] = float(np.nanmean(ndvi))
-            meta["ndmi_mean_bbox"] = float(np.nanmean(ndmi))
-            meta["nbr_mean_bbox"]  = float(np.nanmean(nbr))
-            meta["ndvi_point"] = float(sample_raster_point(ndvi_path, pt_lon, pt_lat))
-            meta["ndmi_point"] = float(sample_raster_point(ndmi_path, pt_lon, pt_lat))
-            meta["nbr_point"]  = float(sample_raster_point(nbr_path,  pt_lon, pt_lat))
-        except Exception as e:
-            meta["landsat_error"] = str(e)
-            meta["landsat_skipped"] = True
-            meta.setdefault("landsat_item_id", None)
-            meta.setdefault("landsat_cloud_cover", None)
-            meta.setdefault("landsat_datetime", None)
-            meta.setdefault("ndvi_mean_bbox", float("nan"))
-            meta.setdefault("ndmi_mean_bbox", float("nan"))
-            meta.setdefault("nbr_mean_bbox", float("nan"))
-            meta.setdefault("ndvi_point", float("nan"))
-            meta.setdefault("ndmi_point", float("nan"))
-            meta.setdefault("nbr_point", float("nan"))
-    else:
-        meta["landsat_skipped"] = True
-        meta.setdefault("landsat_item_id", None)
-        meta.setdefault("landsat_cloud_cover", None)
-        meta.setdefault("landsat_datetime", None)
-        meta.setdefault("ndvi_mean_bbox", float("nan"))
-        meta.setdefault("ndmi_mean_bbox", float("nan"))
-        meta.setdefault("nbr_mean_bbox", float("nan"))
-        meta.setdefault("ndvi_point", float("nan"))
-        meta.setdefault("ndmi_point", float("nan"))
-        meta.setdefault("nbr_point", float("nan"))
+    meta["ndvi_mean_bbox"] = float(np.nanmean(ndvi))
+    meta["ndmi_mean_bbox"] = float(np.nanmean(ndmi))
+    meta["nbr_mean_bbox"]  = float(np.nanmean(nbr))
+    meta["ndvi_point"] = float(sample_raster_point(ndvi_path, pt_lon, pt_lat))
+    meta["ndmi_point"] = float(sample_raster_point(ndmi_path, pt_lon, pt_lat))
+    meta["nbr_point"]  = float(sample_raster_point(nbr_path,  pt_lon, pt_lat))
 
     # -------------------------
     # 2) NLCD canopy + landcover (forest mask + proxy group)
@@ -798,17 +781,11 @@ def run_download_pipeline(
     meta["forest_mask_point"] = int(sample_raster_point(forest_mask_tif, pt_lon, pt_lat))
 
     # forest-only NDVI mean (mask resampled to landsat)
-    meta["ndvi_forest_mean_bbox"] = float("nan")
-    if include_landsat and (landsat_prof is not None) and (ndvi is not None) and os.path.exists(forest_mask_tif):
-        fm_landsat = resample_to_profile(
-            forest_mask_tif,
-            landsat_prof,
-            resampling=Resampling.nearest,
-            dst_dtype="uint8",
-            dst_nodata=0,
-        )
-        if float(fm_landsat.mean()) >= 0.001:
-            meta["ndvi_forest_mean_bbox"] = float(np.nanmean(np.where(fm_landsat == 1, ndvi, np.nan)))
+    fm_landsat = resample_to_profile(forest_mask_tif, landsat_prof, resampling=Resampling.nearest, dst_dtype="uint8", dst_nodata=0)
+    if float(fm_landsat.mean()) < 0.001:
+        meta["ndvi_forest_mean_bbox"] = float("nan")
+    else:
+        meta["ndvi_forest_mean_bbox"] = float(np.nanmean(np.where(fm_landsat == 1, ndvi, np.nan)))
 
     # -------------------------
     # 3) gridMET point series + cleaned climate CSV
@@ -832,6 +809,7 @@ def run_download_pipeline(
         meta["gridmet_tmmx_bbox_var"] = None
 
     # Cleaned climate csv
+    # Cleaned climate csv
     out_clim_clean = os.path.join(job_dir, "climate_point_clean.csv")
     df_pr  = clim_point.get("pr")
     df_tx  = clim_point.get("tmmx")
@@ -844,24 +822,59 @@ def run_download_pipeline(
         num = df.select_dtypes(include=[np.number]).columns.tolist()
         return num[-1] if num else None
 
-    t = pd.to_datetime(df_pr["time"]) if df_pr is not None and "time" in df_pr.columns else None
-
-    pr_col  = next((c for c in (df_pr.columns if df_pr is not None else []) if "precip" in c.lower()), _pick_numeric(df_pr))
-    tx_col  = next((c for c in (df_tx.columns if df_tx is not None else []) if "temp" in c.lower() or "tmmx" in c.lower()), _pick_numeric(df_tx))
-    tn_col  = next((c for c in (df_tn.columns if df_tn is not None else []) if "temp" in c.lower() or "tmmn" in c.lower()), _pick_numeric(df_tn))
+    pr_col  = next((c for c in (df_pr.columns  if df_pr is not None else []) if "precip" in c.lower()), _pick_numeric(df_pr))
+    tx_col  = next((c for c in (df_tx.columns  if df_tx is not None else []) if "temp" in c.lower() or "tmmx" in c.lower()), _pick_numeric(df_tx))
+    tn_col  = next((c for c in (df_tn.columns  if df_tn is not None else []) if "temp" in c.lower() or "tmmn" in c.lower()), _pick_numeric(df_tn))
     vpd_col = next((c for c in (df_vpd.columns if df_vpd is not None else []) if "vapor" in c.lower() or "vpd" in c.lower()), _pick_numeric(df_vpd))
 
-    out = pd.DataFrame({"time": t})
+    def _mk_frame(df: Optional[pd.DataFrame], col: Optional[str], out_name: str, transform=None) -> Optional[pd.DataFrame]:
+        if df is None or col is None or "time" not in df.columns:
+            return None
+        # Normalize to timezone-naive timestamps for clean merges
+        t = pd.to_datetime(df["time"], errors="coerce", utc=True).dt.tz_convert(None)
+        s = df[col]
+        if transform is not None:
+            try:
+                s = transform(s)
+            except Exception:
+                # If decoding fails for any reason, fall back to raw numeric
+                s = pd.to_numeric(s, errors="coerce")
+        return pd.DataFrame({"time": t, out_name: s})
+
+    frames: List[pd.DataFrame] = []
+
     if pr_col:
-        out["pr_mm"] = gridmet_decode(df_pr[pr_col], "pr", meta.get("gridmet_pr_var"))
+        f = _mk_frame(df_pr, pr_col, "pr_mm", lambda s: gridmet_decode(s, "pr", meta.get("gridmet_pr_var")))
+        if f is not None:
+            frames.append(f)
+
     if tx_col:
-        out["tmax_C"] = gridmet_decode_temp_C(df_tx[tx_col], "tmmx", meta.get("gridmet_tmmx_var"))
+        f = _mk_frame(df_tx, tx_col, "tmax_C", lambda s: gridmet_decode_temp_C(s, "tmmx", meta.get("gridmet_tmmx_var")))
+        if f is not None:
+            frames.append(f)
+
     if tn_col:
-        out["tmin_C"] = gridmet_decode_temp_C(df_tn[tn_col], "tmmn", meta.get("gridmet_tmmn_var"))
-    if "tmax_C" in out.columns and "tmin_C" in out.columns:
-        out["tmean_C"] = (out["tmax_C"] + out["tmin_C"]) / 2.0
+        f = _mk_frame(df_tn, tn_col, "tmin_C", lambda s: gridmet_decode_temp_C(s, "tmmn", meta.get("gridmet_tmmn_var")))
+        if f is not None:
+            frames.append(f)
+
     if vpd_col:
-        out["vpd"] = df_vpd[vpd_col].astype("float32")
+        f = _mk_frame(df_vpd, vpd_col, "vpd", lambda s: pd.to_numeric(s, errors="coerce").astype("float32"))
+        if f is not None:
+            frames.append(f)
+
+    out: pd.DataFrame
+    if not frames:
+        # Avoid pandas "all scalar values" error; write a valid empty CSV
+        out = pd.DataFrame(columns=["time", "pr_mm", "tmax_C", "tmin_C", "tmean_C", "vpd"])
+    else:
+        out = frames[0]
+        for f in frames[1:]:
+            out = out.merge(f, on="time", how="outer")
+        out = out.sort_values("time")
+        if "tmax_C" in out.columns and "tmin_C" in out.columns:
+            out["tmean_C"] = (out["tmax_C"] + out["tmin_C"]) / 2.0
+
 
     out.to_csv(out_clim_clean, index=False)
 
