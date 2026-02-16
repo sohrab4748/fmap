@@ -18,7 +18,7 @@ import shutil
 import traceback
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, List, Literal, Tuple
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field, model_validator
