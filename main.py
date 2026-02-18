@@ -19,7 +19,7 @@ import threading
 import glob
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, List, Literal, Tuple
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field, model_validator
@@ -49,11 +49,13 @@ cors = os.getenv("FMAP_CORS_ORIGINS", "").strip()
 if cors:
     origins = [o.strip() for o in cors.split(",") if o.strip()]
 else:
-    origins = []
+    # If not specified, allow all origins (simplifies deployment).
+    # To restrict, set FMAP_CORS_ORIGINS="https://fmap.agrimetsoft.com" (comma-separated).
+    origins = ["*"]
 
 allow_creds = os.getenv("FMAP_CORS_ALLOW_CREDENTIALS", "false").strip().lower() in ("1","true","yes")
-if allow_creds and not origins:
-    raise RuntimeError("FMAP_CORS_ORIGINS is required when FMAP_CORS_ALLOW_CREDENTIALS=true")
+if allow_creds and (not origins or origins == ["*"]):
+    raise RuntimeError("Set FMAP_CORS_ORIGINS to explicit origins when FMAP_CORS_ALLOW_CREDENTIALS=true (wildcard is not allowed).")
 
 
 app.add_middleware(
@@ -80,6 +82,7 @@ async def _on_startup():
         f"service_id={SERVICE_ID} boot_time={BOOT_TIME_UTC} "
         f"JOB_ROOT={JOB_ROOT} root_exists={root_exists} job_dir_count={n_dirs}"
     )
+    print(f"[BOOT] CORS allow_origins={origins} allow_credentials={allow_creds}")
 
 @app.middleware("http")
 async def _add_service_headers(request: Request, call_next):
