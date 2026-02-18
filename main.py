@@ -28,15 +28,30 @@ from fmap_download import run_download_pipeline, ncss_point_csv, GRIDMET_DATASET
 from fmap_analysis import run_analysis, build_manifest
 
 APP_VERSION = "0.1.1"
-# Render note:
-# - /tmp is ephemeral and can be wiped on restarts/redeploys.
-# - If you attach a Render Persistent Disk mounted at /var/data,
-#   we automatically prefer it (or you can set FMAP_JOB_ROOT explicitly).
-_DEFAULT_JOB_ROOT = "/var/data/fmap_jobs" if os.path.isdir("/var/data") else "/tmp/fmap_jobs"
-JOB_ROOT = os.getenv("FMAP_JOB_ROOT", _DEFAULT_JOB_ROOT)
-SERVICE_ID = os.getenv("FMAP_SERVICE_ID") or str(uuid.uuid4())
-BOOT_TIME_UTC = datetime.now(timezone.utc).isoformat()
+JOB_ROOT = os.getenv("FMAP_JOB_ROOT", "/tmp/fmap_jobs")
 MAX_JOB_AGE_SECONDS = int(os.getenv("FMAP_MAX_JOB_AGE_SECONDS", "86400"))  # 24h
+
+def _pick_job_root() -> str:
+    """
+    Choose a job root that survives Render restarts when a disk is attached.
+    Priority:
+      1) FMAP_JOB_ROOT env var
+      2) Render disk default (/var/data) if present
+      3) fallback to /tmp
+    """
+    env_root = os.environ.get("FMAP_JOB_ROOT", "").strip()
+    if env_root:
+        return env_root
+    # Render persistent disks are typically mounted at /var/data
+    if os.path.isdir("/var/data"):
+        return "/var/data/fmap_jobs"
+    # Some platforms use /data
+    if os.path.isdir("/data"):
+        return "/data/fmap_jobs"
+    return "/tmp/fmap_jobs"
+
+JOB_ROOT = _pick_job_root()
+
 
 # Guardrails for Render temporary storage (free instances are typically evicted around ~2GB).
 # - MAX_JOB_BYTES: soft ceiling for a single job directory. If exceeded, we prune intermediates.
@@ -46,6 +61,8 @@ MAX_JOB_BYTES = int(os.getenv("FMAP_MAX_JOB_BYTES", str(int(1.6 * 1024**3))))  #
 ZIP_MAX_BYTES = int(os.getenv("FMAP_ZIP_MAX_BYTES", str(int(900 * 1024**2))))  # ~900MB
 
 os.makedirs(JOB_ROOT, exist_ok=True)
+print(f"[BOOT] JOB_ROOT={JOB_ROOT} exists={os.path.isdir(JOB_ROOT)}")
+
 
 app = FastAPI(title="FMAP-AI API", version=APP_VERSION)
 
@@ -54,13 +71,11 @@ cors = os.getenv("FMAP_CORS_ORIGINS", "").strip()
 if cors:
     origins = [o.strip() for o in cors.split(",") if o.strip()]
 else:
-    # If not specified, allow all origins (simplifies deployment).
-    # To restrict, set FMAP_CORS_ORIGINS="https://fmap.agrimetsoft.com" (comma-separated).
-    origins = ["*"]
+    origins = []
 
 allow_creds = os.getenv("FMAP_CORS_ALLOW_CREDENTIALS", "false").strip().lower() in ("1","true","yes")
-if allow_creds and (not origins or origins == ["*"]):
-    raise RuntimeError("Set FMAP_CORS_ORIGINS to explicit origins when FMAP_CORS_ALLOW_CREDENTIALS=true (wildcard is not allowed).")
+if allow_creds and not origins:
+    raise RuntimeError("FMAP_CORS_ORIGINS is required when FMAP_CORS_ALLOW_CREDENTIALS=true")
 
 
 app.add_middleware(
@@ -72,40 +87,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-@app.on_event("startup")
-async def _on_startup():
-    # High-signal boot info (helps diagnose job_id loss after restarts)
-    try:
-        root_exists = os.path.exists(JOB_ROOT)
-        n_dirs = len([d for d in os.listdir(JOB_ROOT)]) if root_exists else 0
-    except Exception:
-        root_exists = os.path.exists(JOB_ROOT)
-        n_dirs = -1
-    print(
-        "[BOOT] FMAP service started | "
-        f"service_id={SERVICE_ID} boot_time={BOOT_TIME_UTC} "
-        f"JOB_ROOT={JOB_ROOT} root_exists={root_exists} job_dir_count={n_dirs}"
-    )
-    if str(JOB_ROOT).startswith("/tmp"):
-        print(
-            "[BOOT][WARN] JOB_ROOT is under /tmp (ephemeral). "
-            "If the service restarts/redeploys, job directories can be lost. "
-            "Attach a Render Persistent Disk and mount at /var/data, or set FMAP_JOB_ROOT."
-        )
-    print(f"[BOOT] CORS allow_origins={origins} allow_credentials={allow_creds}")
-
-@app.middleware("http")
-async def _add_service_headers(request: Request, call_next):
-    try:
-        response = await call_next(request)
-    except Exception as e:
-        # Ensure we still log unexpected exceptions.
-        print(f"[ERROR] Unhandled exception: {e}")
-        raise
-    response.headers["X-FMAP-Service-ID"] = SERVICE_ID
-    response.headers["X-FMAP-Boot-Time"] = BOOT_TIME_UTC
-    return response
 
 # Simple in-memory job store (sufficient for a single Render instance)
 JOBS: Dict[str, Dict[str, Any]] = {}
@@ -199,40 +180,6 @@ def _find_zip_in_job_dir(job_id: str) -> Optional[str]:
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-def _alert_unknown_job(job_id: str, stage: str = "status") -> None:
-    """Log high-signal context to help diagnose 'Unknown job_id' issues.
-
-    In Render free / ephemeral environments, a service restart or a new instance can wipe /tmp,
-    which makes previously returned job_ids unrecoverable.
-    """
-    try:
-        root_exists = os.path.exists(JOB_ROOT)
-        job_dir = os.path.join(JOB_ROOT, job_id)
-        job_dir_exists = os.path.isdir(job_dir)
-        meta_path = os.path.join(job_dir, "meta.json")
-        meta_exists = os.path.exists(meta_path)
-
-        sample_jobs = []
-        if root_exists:
-            try:
-                # show a few dirs to confirm whether we are on the same instance / disk
-                dirs = [d for d in os.listdir(JOB_ROOT) if os.path.isdir(os.path.join(JOB_ROOT, d))]
-                dirs.sort()
-                sample_jobs = dirs[-10:]
-            except Exception:
-                sample_jobs = []
-
-        print(
-            "[ALERT] Unknown job_id | "
-            f"job_id={job_id} stage={stage} "
-            f"service_id={SERVICE_ID} boot_time={BOOT_TIME_UTC} "
-            f"JOB_ROOT={JOB_ROOT} root_exists={root_exists} "
-            f"job_dir_exists={job_dir_exists} meta_exists={meta_exists} "
-            f"sample_jobs_tail={sample_jobs}"
-        )
-    except Exception as e:
-        print(f"[ALERT] Unknown job_id logger failed: {e}")
 
 
 def _job_dir(job_id: str) -> str:
@@ -564,30 +511,6 @@ def root_head():
     return Response(status_code=200)
 
 
-
-@app.get("/fmap/debug")
-def debug():
-    """Lightweight diagnostics for troubleshooting.
-
-    NOTE: This is intended for development/debugging. You can remove it later.
-    """
-    try:
-        root_exists = os.path.exists(JOB_ROOT)
-        dirs = [d for d in os.listdir(JOB_ROOT) if os.path.isdir(os.path.join(JOB_ROOT, d))] if root_exists else []
-        dirs.sort()
-        tail = dirs[-20:]
-    except Exception:
-        root_exists = os.path.exists(JOB_ROOT)
-        tail = []
-    return {
-        "service_id": SERVICE_ID,
-        "boot_time_utc": BOOT_TIME_UTC,
-        "job_root": JOB_ROOT,
-        "job_root_exists": root_exists,
-        "jobs_in_memory": len(JOBS),
-        "job_dirs_tail": tail,
-    }
-
 @app.post("/fmap/run", response_model=RunResponse)
 def run(req: RunRequest, background: BackgroundTasks):
     _cleanup_old_jobs()
@@ -669,7 +592,6 @@ def status(job_id: str):
     if not meta:
         disk = _load_meta(job_id)
         if not disk:
-            _alert_unknown_job(job_id, stage="unknown_job_id")
             raise HTTPException(status_code=404, detail="Unknown job_id")
         # Cache a minimal in-memory view (optional)
         meta = disk
@@ -705,7 +627,6 @@ def result(job_id: str):
 
         disk = _load_meta(job_id)
         if not disk:
-            _alert_unknown_job(job_id, stage="unknown_job_id")
             raise HTTPException(status_code=404, detail="Unknown job_id")
         meta = disk
 
@@ -745,7 +666,6 @@ def result(job_id: str):
 def download(job_id: str):
     meta = JOBS.get(job_id) or _load_meta(job_id) or _load_result(job_id)
     if not meta:
-        _alert_unknown_job(job_id, stage="unknown_job_id")
         raise HTTPException(status_code=404, detail="Unknown job_id")
 
     zip_path = meta.get("zip_path") or _find_zip_in_job_dir(job_id)
