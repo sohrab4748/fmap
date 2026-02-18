@@ -28,7 +28,12 @@ from fmap_download import run_download_pipeline, ncss_point_csv, GRIDMET_DATASET
 from fmap_analysis import run_analysis, build_manifest
 
 APP_VERSION = "0.1.1"
-JOB_ROOT = os.getenv("FMAP_JOB_ROOT", "/tmp/fmap_jobs")
+# Render note:
+# - /tmp is ephemeral and can be wiped on restarts/redeploys.
+# - If you attach a Render Persistent Disk mounted at /var/data,
+#   we automatically prefer it (or you can set FMAP_JOB_ROOT explicitly).
+_DEFAULT_JOB_ROOT = "/var/data/fmap_jobs" if os.path.isdir("/var/data") else "/tmp/fmap_jobs"
+JOB_ROOT = os.getenv("FMAP_JOB_ROOT", _DEFAULT_JOB_ROOT)
 SERVICE_ID = os.getenv("FMAP_SERVICE_ID") or str(uuid.uuid4())
 BOOT_TIME_UTC = datetime.now(timezone.utc).isoformat()
 MAX_JOB_AGE_SECONDS = int(os.getenv("FMAP_MAX_JOB_AGE_SECONDS", "86400"))  # 24h
@@ -82,6 +87,12 @@ async def _on_startup():
         f"service_id={SERVICE_ID} boot_time={BOOT_TIME_UTC} "
         f"JOB_ROOT={JOB_ROOT} root_exists={root_exists} job_dir_count={n_dirs}"
     )
+    if str(JOB_ROOT).startswith("/tmp"):
+        print(
+            "[BOOT][WARN] JOB_ROOT is under /tmp (ephemeral). "
+            "If the service restarts/redeploys, job directories can be lost. "
+            "Attach a Render Persistent Disk and mount at /var/data, or set FMAP_JOB_ROOT."
+        )
     print(f"[BOOT] CORS allow_origins={origins} allow_credentials={allow_creds}")
 
 @app.middleware("http")
