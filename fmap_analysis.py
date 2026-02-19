@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 import json
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -264,98 +264,6 @@ def run_analysis(job_dir: str, request: Dict[str, Any], download_meta: Dict[str,
     # Carbon loss proxy (placeholder)
     if carbon_loss:
         analysis["carbon_loss_proxy"] = _raster_stats(carbon_loss)
-
-
-    # --- Frontend-friendly summary fields (for legacy/index.html expectations) ---
-    # Some frontends expect a short 'summary' array and shorthand 'agb'/'carbon' blocks.
-    summary: List[str] = []
-
-    # Landcover / canopy
-    lc = analysis.get("landcover", {})
-    if lc.get("nlcd_label_point") is not None and lc.get("nlcd_code_point") is not None:
-        summary.append(f"NLCD at point: {lc.get('nlcd_label_point')} (code {lc.get('nlcd_code_point')})")
-    if lc.get("canopy_pct_point") is not None:
-        summary.append(f"Canopy cover at point (%): {float(lc.get('canopy_pct_point')):.1f}")
-    if lc.get("forest_fraction_bbox") is not None:
-        summary.append(f"Forest fraction in bbox: {float(lc.get('forest_fraction_bbox')):.3f}")
-
-    # Vegetation indices
-    veg = analysis.get("vegetation", {})
-    try:
-        ndvi = (veg.get("ndvi") or {})
-        if ndvi.get("point") is not None:
-            summary.append(f"NDVI at point: {float(ndvi.get('point')):.3f}")
-        if ndvi.get("bbox_mean") is not None:
-            summary.append(f"NDVI mean (bbox): {float(ndvi.get('bbox_mean')):.3f}")
-    except Exception:
-        pass
-    if veg.get("ndvi_forest_mean_bbox") is not None:
-        try:
-            summary.append(f"NDVI mean (forest pixels, bbox): {float(veg.get('ndvi_forest_mean_bbox')):.3f}")
-        except Exception:
-            pass
-
-    # Disturbance
-    dist = analysis.get("disturbance", {})
-    if dist.get("wfigs_features_in_bbox") is not None:
-        summary.append(f"WFIGS fire perimeters in bbox: {int(dist.get('wfigs_features_in_bbox'))}")
-    if dist.get("burned_area_total_km2") is not None:
-        try:
-            summary.append(f"Burned area total (km²): {float(dist.get('burned_area_total_km2')):.3f}")
-        except Exception:
-            pass
-
-    # Biomass / carbon shorthand fields (expected by some frontends)
-    bc = analysis.get("biomass_carbon", {}) if isinstance(analysis.get("biomass_carbon", {}), dict) else {}
-    agb_blk = bc.get("agb", {}) if isinstance(bc.get("agb", {}), dict) else {}
-    agc_blk = bc.get("agc", {}) if isinstance(bc.get("agc", {}), dict) else {}
-
-    agb_point_mg = agb_blk.get("point_MgHa")
-    agb_point_lb = agb_blk.get("point_lb_ac")
-    carbon_point_mg = agc_blk.get("point_MgHa")
-    carbon_point_lb = agc_blk.get("point_lb_ac")
-
-    agb_forest_mean = None
-    try:
-        agb_forest_mean = (agb_blk.get("forest_stats_MgHa", {}) or {}).get("mean")
-    except Exception:
-        agb_forest_mean = None
-
-    carbon_forest_mean = None
-    try:
-        carbon_forest_mean = (agc_blk.get("forest_stats_MgHa", {}) or {}).get("mean")
-    except Exception:
-        carbon_forest_mean = None
-
-    analysis["agb"] = {
-        "point_mg_ha": float(agb_point_mg) if agb_point_mg is not None else None,
-        "point_lb_ac": float(agb_point_lb) if agb_point_lb is not None else None,
-        "forest_mean_mg_ha": float(agb_forest_mean) if agb_forest_mean is not None else None,
-    }
-    analysis["carbon"] = {
-        "point_mg_ha": float(carbon_point_mg) if carbon_point_mg is not None else None,
-        "point_lb_ac": float(carbon_point_lb) if carbon_point_lb is not None else None,
-        "forest_mean_mg_ha": float(carbon_forest_mean) if carbon_forest_mean is not None else None,
-    }
-
-    if analysis["agb"].get("point_mg_ha") is not None:
-        summary.append(f"Aboveground biomass (AGB) at point (Mg/ha): {analysis['agb']['point_mg_ha']:.3f}")
-    if analysis["carbon"].get("point_mg_ha") is not None:
-        summary.append(f"Aboveground carbon at point (Mg/ha): {analysis['carbon']['point_mg_ha']:.3f}")
-    if analysis["agb"].get("forest_mean_mg_ha") is not None:
-        summary.append(f"AGB mean over forest pixels (bbox, Mg/ha): {analysis['agb']['forest_mean_mg_ha']:.3f}")
-    if analysis["carbon"].get("forest_mean_mg_ha") is not None:
-        summary.append(f"Carbon mean over forest pixels (bbox, Mg/ha): {analysis['carbon']['forest_mean_mg_ha']:.3f}")
-
-    # Bubble up any biomass notes
-    try:
-        for n in (bc.get("notes", []) or []):
-            if n:
-                summary.append(str(n))
-    except Exception:
-        pass
-
-    analysis["summary"] = summary
 
     # Save analysis json into job_dir for auditing/download
     out_json = os.path.join(job_dir, "analysis_result.json")
