@@ -14,12 +14,13 @@ import time
 import uuid
 import shutil
 import traceback
-import json
-import threading
-import glob
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, List, Literal, Tuple
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+import http.client
+import ssl
+import mimetypes
+from urllib.parse import urlparse
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field, model_validator
@@ -31,28 +32,6 @@ APP_VERSION = "0.1.1"
 JOB_ROOT = os.getenv("FMAP_JOB_ROOT", "/tmp/fmap_jobs")
 MAX_JOB_AGE_SECONDS = int(os.getenv("FMAP_MAX_JOB_AGE_SECONDS", "86400"))  # 24h
 
-def _pick_job_root() -> str:
-    """
-    Choose a job root that survives Render restarts when a disk is attached.
-    Priority:
-      1) FMAP_JOB_ROOT env var
-      2) Render disk default (/var/data) if present
-      3) fallback to /tmp
-    """
-    env_root = os.environ.get("FMAP_JOB_ROOT", "").strip()
-    if env_root:
-        return env_root
-    # Render persistent disks are typically mounted at /var/data
-    if os.path.isdir("/var/data"):
-        return "/var/data/fmap_jobs"
-    # Some platforms use /data
-    if os.path.isdir("/data"):
-        return "/data/fmap_jobs"
-    return "/tmp/fmap_jobs"
-
-JOB_ROOT = _pick_job_root()
-
-
 # Guardrails for Render temporary storage (free instances are typically evicted around ~2GB).
 # - MAX_JOB_BYTES: soft ceiling for a single job directory. If exceeded, we prune intermediates.
 # - ZIP_MAX_BYTES: refuse to build a ZIP if the directory is larger than this, to avoid duplicating
@@ -61,8 +40,6 @@ MAX_JOB_BYTES = int(os.getenv("FMAP_MAX_JOB_BYTES", str(int(1.6 * 1024**3))))  #
 ZIP_MAX_BYTES = int(os.getenv("FMAP_ZIP_MAX_BYTES", str(int(900 * 1024**2))))  # ~900MB
 
 os.makedirs(JOB_ROOT, exist_ok=True)
-print(f"[BOOT] JOB_ROOT={JOB_ROOT} exists={os.path.isdir(JOB_ROOT)}")
-
 
 app = FastAPI(title="FMAP-AI API", version=APP_VERSION)
 
@@ -90,91 +67,192 @@ app.add_middleware(
 
 # Simple in-memory job store (sufficient for a single Render instance)
 JOBS: Dict[str, Dict[str, Any]] = {}
-# ----------------------------
-# Lightweight on-disk persistence
-# ----------------------------
-# Why: Render (and Gunicorn) may restart workers, and multiple workers can lead to
-# status polling hitting a different worker than the one that started the job.
-# We persist minimal job state in the job directory so /status and /result remain stable.
 
-META_FILENAME = "job_meta.json"
-RESULT_FILENAME = "result.json"
+# --- Best-effort job state persistence (to /tmp only) ---
+STATE_FILENAME = "job_state.json"
 
+def _job_dir_for(job_id: str) -> Path:
+    return JOB_ROOT / job_id
 
-def _meta_path(job_id: str) -> str:
-    return os.path.join(_job_dir(job_id), META_FILENAME)
-
-
-def _result_path(job_id: str) -> str:
-    return os.path.join(_job_dir(job_id), RESULT_FILENAME)
-
-
-def _safe_write_json(path: str, payload: Dict[str, Any]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
-    os.replace(tmp, path)
-
-
-def _load_json(path: str) -> Optional[Dict[str, Any]]:
+def _persist_job_state(job_id: str) -> None:
     try:
-        if not os.path.exists(path):
-            return None
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
+        meta = JOBS.get(job_id)
+        if not meta:
+            return
+        d = _job_dir_for(job_id)
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / STATE_FILENAME
+        with p.open("w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[WARN] persist_job_state failed job_id={job_id} err={e}")
 
+def _load_job_state_from_disk(job_id: str):
+    try:
+        p = _job_dir_for(job_id) / STATE_FILENAME
+        if p.exists():
+            return json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"[WARN] load_job_state failed job_id={job_id} err={e}")
+    return None
 
-def _persist_meta(job_id: str) -> None:
-    meta = JOBS.get(job_id)
-    if not meta:
+# --- Optional push-to-.NET (no Render Disk required) ---
+PUSH_URL = (os.getenv("FMAPPUSH_URL") or "").strip()
+PUSH_TOKEN = (os.getenv("FMAPPUSH_TOKEN") or "").strip()
+PUSH_DELETE_LOCAL_DEFAULT = (os.getenv("FMAPPUSH_DELETE_LOCAL") or "0").strip().lower() in ("1", "true", "yes", "y")
+PUSH_INCLUDE_ZIP = (os.getenv("FMAPPUSH_INCLUDE_ZIP") or "0").strip().lower() in ("1", "true", "yes", "y")
+PUSH_TIMEOUT_SEC = int((os.getenv("FMAPPUSH_TIMEOUT_SEC") or "900").strip() or "900")
+PUSH_MAX_RETRIES = int((os.getenv("FMAPPUSH_MAX_RETRIES") or "3").strip() or "3")
+
+def _classify_push_kind(fname: str) -> str:
+    f = fname.lower()
+    if f in ("job_meta.json", "download_meta.json", "analysis_result.json", "timeseries_point_daily.json", "timeseries_point_monthly.json"):
+        return "computed"
+    if f.endswith(".nc") or f.endswith("_raw.tif") or f.endswith("_raw_bbox.tif") or f.endswith(".geojson"):
+        return "downloaded"
+    return "computed"
+
+def _post_bytes(url: str, body: bytes, headers: dict):
+    u = urlparse(url)
+    scheme = (u.scheme or "https").lower()
+    host = u.hostname
+    port = u.port or (443 if scheme == "https" else 80)
+    path = u.path or "/"
+    if u.query:
+        path = path + "?" + u.query
+
+    if scheme == "https":
+        conn = http.client.HTTPSConnection(host, port, timeout=PUSH_TIMEOUT_SEC, context=ssl.create_default_context())
+    else:
+        conn = http.client.HTTPConnection(host, port, timeout=PUSH_TIMEOUT_SEC)
+
+    try:
+        conn.putrequest("POST", path)
+        for k, v in headers.items():
+            conn.putheader(k, str(v))
+        conn.putheader("Content-Length", str(len(body)))
+        conn.endheaders()
+        conn.send(body)
+        resp = conn.getresponse()
+        data = resp.read()
+        if resp.status >= 400:
+            raise RuntimeError(f"push failed HTTP {resp.status} | {data[:300]!r}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+def _post_file(url: str, file_path: str, headers: dict):
+    u = urlparse(url)
+    scheme = (u.scheme or "https").lower()
+    host = u.hostname
+    port = u.port or (443 if scheme == "https" else 80)
+    path = u.path or "/"
+    if u.query:
+        path = path + "?" + u.query
+
+    if scheme == "https":
+        conn = http.client.HTTPSConnection(host, port, timeout=PUSH_TIMEOUT_SEC, context=ssl.create_default_context())
+    else:
+        conn = http.client.HTTPConnection(host, port, timeout=PUSH_TIMEOUT_SEC)
+
+    size = os.path.getsize(file_path)
+    try:
+        conn.putrequest("POST", path)
+        for k, v in headers.items():
+            conn.putheader(k, str(v))
+        conn.putheader("Content-Length", str(size))
+        conn.endheaders()
+        with open(file_path, "rb") as f:
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                conn.send(chunk)
+        resp = conn.getresponse()
+        data = resp.read()
+        if resp.status >= 400:
+            raise RuntimeError(f"push failed HTTP {resp.status} | {data[:300]!r}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+def _push_event(job_id: str, event: str, payload: dict):
+    if not PUSH_URL or not PUSH_TOKEN:
         return
-    # Keep meta small/stable
-    payload = {
-        "job_id": job_id,
-        "status": meta.get("status", "unknown"),
-        "started_at": meta.get("started_at"),
-        "finished_at": meta.get("finished_at"),
-        "error": meta.get("error"),
-        "traceback": meta.get("traceback"),
-        "job_dir": meta.get("job_dir") or _job_dir(job_id),
-        "zip_path": meta.get("zip_path"),
-        "request": meta.get("request"),
+    headers = {
+        "Content-Type": "application/json",
+        "X-FMAP-Token": PUSH_TOKEN,
+        "X-FMAP-JobId": job_id,
+        "X-FMAP-Event": event,
     }
-    _safe_write_json(_meta_path(job_id), payload)
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    for attempt in range(1, PUSH_MAX_RETRIES + 1):
+        try:
+            _post_bytes(PUSH_URL, body=body, headers=headers)
+            return
+        except Exception:
+            if attempt == PUSH_MAX_RETRIES:
+                raise
+            time.sleep(min(2 ** attempt, 10))
 
+def _push_all_files(job_id: str, job_dir: str, delete_local: bool):
+    if not PUSH_URL or not PUSH_TOKEN:
+        return {"enabled": False}
 
-def _persist_result(job_id: str, analysis: Dict[str, Any], manifest: Dict[str, Any]) -> None:
-    meta = JOBS.get(job_id) or {}
-    payload = {
-        "job_id": job_id,
-        "status": meta.get("status", "done"),
-        "started_at": meta.get("started_at"),
-        "finished_at": meta.get("finished_at"),
-        "analysis": analysis or {},
-        "manifest": manifest or {},
-        "download_url": f"/fmap/download/{job_id}" if meta.get("zip_path") else None,
-    }
-    _safe_write_json(_result_path(job_id), payload)
+    job_dir_path = Path(job_dir)
+    pushed = []
+    failed = []
 
+    files = []
+    for p in sorted(job_dir_path.glob("*")):
+        if not p.is_file():
+            continue
+        if p.name == STATE_FILENAME:
+            continue
+        if (not PUSH_INCLUDE_ZIP) and p.suffix.lower() == ".zip":
+            continue
+        files.append(p)
 
-def _load_meta(job_id: str) -> Optional[Dict[str, Any]]:
-    return _load_json(_meta_path(job_id))
+    _push_event(job_id, "push_start", {"file_count": len(files), "include_zip": PUSH_INCLUDE_ZIP, "delete_local": delete_local})
 
+    for p in files:
+        kind = _classify_push_kind(p.name)
+        ctype = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
+        headers = {
+            "Content-Type": ctype,
+            "X-FMAP-Token": PUSH_TOKEN,
+            "X-FMAP-JobId": job_id,
+            "X-FMAP-Filename": p.name,
+            "X-FMAP-Kind": kind,
+        }
 
-def _load_result(job_id: str) -> Optional[Dict[str, Any]]:
-    return _load_json(_result_path(job_id))
+        ok = False
+        last_err = None
+        for attempt in range(1, PUSH_MAX_RETRIES + 1):
+            try:
+                _post_file(PUSH_URL, str(p), headers=headers)
+                ok = True
+                break
+            except Exception as e:
+                last_err = str(e)
+                time.sleep(min(2 ** attempt, 10))
 
+        if ok:
+            pushed.append({"name": p.name, "kind": kind, "bytes": int(p.stat().st_size)})
+            if delete_local:
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+        else:
+            failed.append({"name": p.name, "kind": kind, "error": last_err})
 
-def _find_zip_in_job_dir(job_id: str) -> Optional[str]:
-    job_dir = _job_dir(job_id)
-    try:
-        zips = glob.glob(os.path.join(job_dir, "*.zip"))
-        return zips[0] if zips else None
-    except Exception:
-        return None
+    _push_event(job_id, "push_complete", {"pushed": pushed, "failed": failed})
+    return {"enabled": True, "pushed": pushed, "failed": failed, "delete_local": delete_local, "include_zip": PUSH_INCLUDE_ZIP}
 
 
 
@@ -387,8 +465,6 @@ def _run_job(job_id: str, req: RunRequest) -> None:
         }
     )
 
-    _persist_meta(job_id)
-
     try:
         download_meta = run_download_pipeline(
             job_dir=job_dir,
@@ -465,12 +541,6 @@ def _run_job(job_id: str, req: RunRequest) -> None:
             }
         )
 
-        try:
-            _persist_meta(job_id)
-            _persist_result(job_id, analysis=analysis if isinstance(analysis, dict) else {}, manifest=manifest)
-        except Exception:
-            pass
-
     except Exception as e:
         err = f"{type(e).__name__}: {str(e)}"
         tb = traceback.format_exc(limit=10)
@@ -482,11 +552,6 @@ def _run_job(job_id: str, req: RunRequest) -> None:
                 "traceback": tb,
             }
         )
-
-        try:
-            _persist_meta(job_id)
-        except Exception:
-            pass
 
         # Always try to reclaim disk if a job fails (prevents repeated evictions).
         try:
@@ -522,18 +587,9 @@ def run(req: RunRequest, background: BackgroundTasks):
         "started_epoch": time.time(),
         "job_dir": _job_dir(job_id),
     }
+    _persist_job_state(job_id)
 
-    # Persist immediately so status polling works across workers/restarts
-    try:
-        JOBS[job_id]["request"] = req.model_dump()
-        os.makedirs(JOBS[job_id]["job_dir"], exist_ok=True)
-        _persist_meta(job_id)
-    except Exception:
-        pass
-
-    # Run heavy work in a daemon thread so the API remains responsive during processing
-    t = threading.Thread(target=_run_job, args=(job_id, req), daemon=True)
-    t.start()
+    background.add_task(_run_job, job_id, req)
 
     download_url = f"/fmap/download/{job_id}" if req.include_zip else None
     return RunResponse(
@@ -557,13 +613,7 @@ def run_sync(req: RunRequest):
         "started_epoch": time.time(),
         "job_dir": _job_dir(job_id),
     }
-
-    try:
-        JOBS[job_id]["request"] = req.model_dump()
-        os.makedirs(JOBS[job_id]["job_dir"], exist_ok=True)
-        _persist_meta(job_id)
-    except Exception:
-        pass
+    _persist_job_state(job_id)
     _run_job(job_id, req)
 
     meta = JOBS.get(job_id)
@@ -586,15 +636,14 @@ def run_sync(req: RunRequest):
 
 
 @app.get("/fmap/status/{job_id}", response_model=StatusResponse)
-
 def status(job_id: str):
     meta = JOBS.get(job_id)
     if not meta:
-        disk = _load_meta(job_id)
-        if not disk:
+        meta = _load_job_state_from_disk(job_id)
+        if meta:
+            JOBS[job_id] = meta
+        else:
             raise HTTPException(status_code=404, detail="Unknown job_id")
-        # Cache a minimal in-memory view (optional)
-        meta = disk
     return StatusResponse(
         job_id=job_id,
         status=meta.get("status", "unknown"),
@@ -603,32 +652,12 @@ def status(job_id: str):
         error=meta.get("error"),
     )
 
-@app.get("/fmap/result/{job_id}", response_model=ResultResponse)
 
+@app.get("/fmap/result/{job_id}", response_model=ResultResponse)
 def result(job_id: str):
     meta = JOBS.get(job_id)
     if not meta:
-        # Prefer the persisted result if available
-        persisted = _load_result(job_id)
-        if persisted:
-            if persisted.get("status") in ("queued", "running"):
-                raise HTTPException(status_code=409, detail={"status": persisted.get("status"), "message": "Not finished yet. Use /fmap/status."})
-            if persisted.get("status") == "error":
-                raise HTTPException(status_code=500, detail={"error": persisted.get("error"), "traceback": persisted.get("traceback")})
-            return ResultResponse(
-                job_id=job_id,
-                status=persisted.get("status", "done"),
-                started_at=persisted.get("started_at"),
-                finished_at=persisted.get("finished_at") or _utc_now(),
-                analysis=persisted.get("analysis") or {},
-                manifest=persisted.get("manifest") or {},
-                download_url=persisted.get("download_url"),
-            )
-
-        disk = _load_meta(job_id)
-        if not disk:
-            raise HTTPException(status_code=404, detail="Unknown job_id")
-        meta = disk
+        raise HTTPException(status_code=404, detail="Unknown job_id")
 
     if meta.get("status") in ("queued", "running"):
         raise HTTPException(status_code=409, detail={"status": meta.get("status"), "message": "Not finished yet. Use /fmap/status."})
@@ -636,43 +665,30 @@ def result(job_id: str):
     if meta.get("status") == "error":
         raise HTTPException(status_code=500, detail={"error": meta.get("error"), "traceback": meta.get("traceback")})
 
-    # If we have a persisted result, return it (it contains full analysis/manifest)
-    persisted = _load_result(job_id)
-    if persisted and persisted.get("analysis") is not None and persisted.get("manifest") is not None:
-        download_url = persisted.get("download_url")
-        return ResultResponse(
-            job_id=job_id,
-            status=persisted.get("status", meta.get("status", "done")),
-            started_at=persisted.get("started_at") or meta.get("started_at"),
-            finished_at=persisted.get("finished_at") or meta.get("finished_at") or _utc_now(),
-            analysis=persisted.get("analysis") or {},
-            manifest=persisted.get("manifest") or {},
-            download_url=download_url,
-        )
-
     download_url = f"/fmap/download/{job_id}" if meta.get("zip_path") else None
     return ResultResponse(
         job_id=job_id,
         status=meta["status"],
         started_at=meta["started_at"],
         finished_at=meta["finished_at"],
-        analysis=meta.get("analysis") or {},
-        manifest=meta.get("manifest") or {},
+        analysis=meta["analysis"],
+        manifest=meta["manifest"],
         download_url=download_url,
     )
 
-@app.get("/fmap/download/{job_id}")
 
+@app.get("/fmap/download/{job_id}")
 def download(job_id: str):
-    meta = JOBS.get(job_id) or _load_meta(job_id) or _load_result(job_id)
+    meta = JOBS.get(job_id)
     if not meta:
         raise HTTPException(status_code=404, detail="Unknown job_id")
 
-    zip_path = meta.get("zip_path") or _find_zip_in_job_dir(job_id)
+    zip_path = meta.get("zip_path")
     if not zip_path or not os.path.exists(zip_path):
         raise HTTPException(status_code=404, detail="ZIP not available for this job (run with include_zip=true).")
 
     return FileResponse(zip_path, media_type="application/zip", filename=os.path.basename(zip_path))
+
 
 # ----------------------------
 # Time series helpers / API
