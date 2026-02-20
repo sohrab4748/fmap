@@ -376,7 +376,7 @@ def health():
 
 
 
-@app.api_route("/health_head", methods=["HEAD"])
+@app.api_route("/health_head", methods=["GET", "HEAD"])
 def health_head():
     return Response(status_code=200)
 
