@@ -23,13 +23,10 @@ from pydantic import BaseModel, Field, model_validator
 
 from fmap_download import run_download_pipeline, ncss_point_csv, GRIDMET_DATASETS, spi_gamma_monthly
 from fmap_analysis import run_analysis, build_manifest
+import threading
 
 APP_VERSION = "0.1.1"
 JOB_ROOT = os.getenv("FMAP_JOB_ROOT", "/tmp/fmap_jobs")
-JOB_STATE_FILENAME = "job_state.json"
-JOB_LOG_FILENAME = "job.log"
-SERVICE_ID = uuid.uuid4().hex
-
 MAX_JOB_AGE_SECONDS = int(os.getenv("FMAP_MAX_JOB_AGE_SECONDS", "86400"))  # 24h
 
 # Guardrails for Render temporary storage (free instances are typically evicted around ~2GB).
@@ -67,70 +64,6 @@ app.add_middleware(
 
 # Simple in-memory job store (sufficient for a single Render instance)
 JOBS: Dict[str, Dict[str, Any]] = {}
-
-def _job_log_path(job_dir: str) -> str:
-    return os.path.join(job_dir, JOB_LOG_FILENAME)
-
-def _job_state_path(job_dir: str) -> str:
-    return os.path.join(job_dir, JOB_STATE_FILENAME)
-
-def _append_job_log(job_dir: str, msg: str) -> None:
-    try:
-        ts = _utc_now()
-        line = f"[{ts}] {msg}\n"
-        # Render logs
-        print(line.rstrip(), flush=True)
-        # Per-job log file
-        with open(_job_log_path(job_dir), "a", encoding="utf-8") as f:
-            f.write(line)
-    except Exception:
-        pass
-
-def _load_job_state(job_id: str) -> Optional[Dict[str, Any]]:
-    job_dir = _job_dir(job_id)
-    p = _job_state_path(job_dir)
-    if not os.path.exists(p):
-        return None
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
-
-def _write_job_state(job_id: str, job_dir: str, **updates: Any) -> Dict[str, Any]:
-    """
-    Update in-memory JOBS[job_id] and persist a small state JSON to disk.
-    This is your main 'alert/progress' mechanism for debugging long runs.
-    """
-    os.makedirs(job_dir, exist_ok=True)
-    meta = JOBS.get(job_id, {})
-    meta.update(updates)
-    meta.setdefault("job_id", job_id)
-    meta.setdefault("job_dir", job_dir)
-    meta.setdefault("service_id", SERVICE_ID)
-    meta["updated_at"] = _utc_now()
-    JOBS[job_id] = meta
-
-    state = {
-        "job_id": job_id,
-        "status": meta.get("status"),
-        "stage": meta.get("stage"),
-        "message": meta.get("message"),
-        "started_at": meta.get("started_at"),
-        "finished_at": meta.get("finished_at"),
-        "error": meta.get("error"),
-        "updated_at": meta.get("updated_at"),
-        "service_id": meta.get("service_id"),
-        "job_dir": job_dir,
-        "job_dir_bytes": meta.get("job_dir_bytes"),
-    }
-    try:
-        with open(_job_state_path(job_dir), "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2)
-    except Exception:
-        pass
-    return meta
-
 
 
 def _utc_now() -> str:
@@ -314,13 +247,9 @@ class RunResponse(BaseModel):
 class StatusResponse(BaseModel):
     job_id: str
     status: str
-    stage: Optional[str] = None
-    message: Optional[str] = None
     started_at: str
-    updated_at: Optional[str] = None
     finished_at: Optional[str] = None
     error: Optional[str] = None
-    job_dir_bytes: Optional[int] = None
 
 
 class ResultResponse(BaseModel):
@@ -337,15 +266,16 @@ def _run_job(job_id: str, req: RunRequest) -> None:
     job_dir = _job_dir(job_id)
     os.makedirs(job_dir, exist_ok=True)
 
-    _write_job_state(job_id, job_dir,
-        status="running", stage="starting", message="Job started.",
-        job_dir=job_dir, started_at=_utc_now(), started_epoch=time.time()
+    JOBS[job_id].update(
+        {
+            "status": "running",
+            "job_dir": job_dir,
+            "started_at": _utc_now(),
+            "started_epoch": time.time(),
+        }
     )
-    _append_job_log(job_dir, "Stage: starting")
 
     try:
-        _write_job_state(job_id, job_dir, stage="download", message="Downloading/deriving inputs (NLCD, gridMET, Landsat, FIA, MTBS, WFIGS).")
-        _append_job_log(job_dir, "Stage: download")
         download_meta = run_download_pipeline(
             job_dir=job_dir,
             pt_lon=req.pt_lon,
@@ -360,7 +290,6 @@ def _run_job(job_id: str, req: RunRequest) -> None:
 
         # Storage guardrail (Render free instances can be evicted near ~2GB temp usage).
         bytes_after_download = _dir_size_bytes(job_dir)
-        _write_job_state(job_id, job_dir, job_dir_bytes=int(bytes_after_download), message=f"Downloaded outputs size: {bytes_after_download/1024**2:.1f} MB")
         JOBS[job_id]["job_dir_bytes_after_download"] = int(bytes_after_download)
         if bytes_after_download > MAX_JOB_BYTES:
             raise RuntimeError(
@@ -369,8 +298,6 @@ def _run_job(job_id: str, req: RunRequest) -> None:
                 "limit products, or run on an instance with persistent disk."
             )
 
-        _write_job_state(job_id, job_dir, stage="analysis", message="Running analysis and building summaries.")
-        _append_job_log(job_dir, "Stage: analysis")
         analysis = run_analysis(job_dir=job_dir, request=req.model_dump(), download_meta=download_meta)
 
         # --- Optional time-series products (point and/or region) ---
@@ -401,15 +328,11 @@ def _run_job(job_id: str, req: RunRequest) -> None:
                 "Try keep_rasters=false, reduce bbox/size_px, or upgrade to a persistent-disk instance."
             )
 
-        _write_job_state(job_id, job_dir, stage="manifest", message="Building output manifest.")
-        _append_job_log(job_dir, "Stage: manifest")
         manifest = build_manifest(job_dir)
 
         # Optionally build zip for user download (zipping duplicates bytes temporarily).
         zip_path = None
         if req.include_zip:
-            _write_job_state(job_id, job_dir, stage="zip", message="Building ZIP for download.")
-            _append_job_log(job_dir, "Stage: zip")
             bytes_for_zip = _dir_size_bytes(job_dir)
             if bytes_for_zip > ZIP_MAX_BYTES:
                 raise RuntimeError(
@@ -418,28 +341,22 @@ def _run_job(job_id: str, req: RunRequest) -> None:
                 )
             zip_path = shutil.make_archive(os.path.join(job_dir, f"{job_id}_outputs"), "zip", job_dir)
 
-        _write_job_state(job_id, job_dir, status="done", stage="done", message="Job completed successfully.", finished_at=_utc_now(), job_dir_bytes=_dir_size_bytes(job_dir))
         JOBS[job_id].update(
             {
                 "status": "done",
-                "stage": "done",
                 "finished_at": _utc_now(),
                 "analysis": analysis,
                 "manifest": manifest,
                 "zip_path": zip_path,
             }
         )
-        _append_job_log(job_dir, "Stage: done")
 
     except Exception as e:
         err = f"{type(e).__name__}: {str(e)}"
         tb = traceback.format_exc(limit=10)
-        _write_job_state(job_id, job_dir, status="error", stage="error", message="Job failed.", finished_at=_utc_now(), error=err, job_dir_bytes=_dir_size_bytes(job_dir))
-        _append_job_log(job_dir, f"Stage: error | {err}")
         JOBS[job_id].update(
             {
                 "status": "error",
-                "stage": "error",
                 "finished_at": _utc_now(),
                 "error": err,
                 "traceback": tb,
@@ -481,9 +398,7 @@ def run(req: RunRequest, background: BackgroundTasks):
         "job_dir": _job_dir(job_id),
     }
 
-        # Run the heavy pipeline in a dedicated thread so /fmap/status remains responsive.
-    t = threading.Thread(target=_run_job, args=(job_id, req), daemon=True)
-    t.start()
+    background.add_task(_run_job, job_id, req)
 
     download_url = f"/fmap/download/{job_id}" if req.include_zip else None
     return RunResponse(
@@ -532,48 +447,17 @@ def run_sync(req: RunRequest):
 def status(job_id: str):
     meta = JOBS.get(job_id)
     if not meta:
-        state = _load_job_state(job_id)
-        if not state:
-            raise HTTPException(status_code=404, detail="Unknown job_id")
-        return StatusResponse(
-            job_id=job_id,
-            status=state.get("status", "unknown"),
-            stage=state.get("stage"),
-            message=state.get("message"),
-            started_at=state.get("started_at") or state.get("updated_at") or _utc_now(),
-            updated_at=state.get("updated_at"),
-            finished_at=state.get("finished_at"),
-            error=state.get("error"),
-            job_dir_bytes=state.get("job_dir_bytes"),
-        )
-
-    # live in-memory status
-    job_dir = meta.get("job_dir") or _job_dir(job_id)
-    try:
-        meta["job_dir_bytes"] = int(_dir_size_bytes(job_dir))
-    except Exception:
-        pass
-    # best-effort persist on each status call (useful if the process restarts later)
-    try:
-        _write_job_state(job_id, job_dir, **meta)
-    except Exception:
-        pass
-
+        raise HTTPException(status_code=404, detail="Unknown job_id")
     return StatusResponse(
         job_id=job_id,
         status=meta.get("status", "unknown"),
-        stage=meta.get("stage"),
-        message=meta.get("message"),
         started_at=meta.get("started_at"),
-        updated_at=meta.get("updated_at"),
         finished_at=meta.get("finished_at"),
         error=meta.get("error"),
-        job_dir_bytes=meta.get("job_dir_bytes"),
     )
 
 
 @app.get("/fmap/result/{job_id}", response_model=ResultResponse)
-
 def result(job_id: str):
     meta = JOBS.get(job_id)
     if not meta:
@@ -941,28 +825,6 @@ def _compute_region_mean_timeseries(job_dir: str, req: RunRequest) -> None:
         out_spi = os.path.join(job_dir, "spi30_region.csv")
         spi_df.to_csv(out_spi, index=False)
 
-
-
-@app.get("/fmap/log/{job_id}")
-def job_log(job_id: str, lines: int = 200) -> Response:
-    """Return the last N lines of the per-job log file (helps debug long runs)."""
-    try:
-        lines = int(lines)
-    except Exception:
-        lines = 200
-    lines = max(20, min(lines, 2000))
-
-    job_dir = _job_dir(job_id)
-    log_path = _job_log_path(job_dir)
-    if not os.path.exists(log_path):
-        raise HTTPException(status_code=404, detail="Log not found for this job.")
-    try:
-        with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
-            data = f.read().splitlines()
-        tail = data[-lines:]
-        return Response(content="\n".join(tail), media_type="text/plain")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/fmap/timeseries/{job_id}")
 def fmap_timeseries(job_id: str, kind: str = "point", freq: str = "daily") -> Response:
