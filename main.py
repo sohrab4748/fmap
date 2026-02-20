@@ -23,14 +23,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from fmap_download import run_download_pipeline, ncss_point_csv, GRIDMET_DATASETS, spi_gamma_monthly
 from fmap_analysis import run_analysis, build_manifest
-import threading
 
-from fastapi import Response
-
-@app.api_route("/health_head", methods=["HEAD"])
-def health_head():
-    return Response(status_code=200)
-  
 APP_VERSION = "0.1.1"
 JOB_ROOT = os.getenv("FMAP_JOB_ROOT", "/tmp/fmap_jobs")
 MAX_JOB_AGE_SECONDS = int(os.getenv("FMAP_MAX_JOB_AGE_SECONDS", "86400"))  # 24h
@@ -381,6 +374,11 @@ def _run_job(job_id: str, req: RunRequest) -> None:
 def health():
     return {"ok": True, "version": APP_VERSION}
 
+
+
+@app.api_route("/health_head", methods=["HEAD"])
+def health_head():
+    return Response(status_code=200)
 
 @app.get("/")
 def root():
