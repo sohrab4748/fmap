@@ -14,6 +14,8 @@ import time
 import uuid
 import shutil
 import traceback
+import json
+from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, List, Literal, Tuple
 import http.client
@@ -30,6 +32,7 @@ from fmap_analysis import run_analysis, build_manifest
 
 APP_VERSION = "0.1.1"
 JOB_ROOT = os.getenv("FMAP_JOB_ROOT", "/tmp/fmap_jobs")
+JOB_ROOT_PATH = Path(JOB_ROOT)
 MAX_JOB_AGE_SECONDS = int(os.getenv("FMAP_MAX_JOB_AGE_SECONDS", "86400"))  # 24h
 
 # Guardrails for Render temporary storage (free instances are typically evicted around ~2GB).
@@ -39,7 +42,7 @@ MAX_JOB_AGE_SECONDS = int(os.getenv("FMAP_MAX_JOB_AGE_SECONDS", "86400"))  # 24h
 MAX_JOB_BYTES = int(os.getenv("FMAP_MAX_JOB_BYTES", str(int(1.6 * 1024**3))))  # ~1.6GB
 ZIP_MAX_BYTES = int(os.getenv("FMAP_ZIP_MAX_BYTES", str(int(900 * 1024**2))))  # ~900MB
 
-os.makedirs(JOB_ROOT, exist_ok=True)
+os.makedirs(JOB_ROOT, exist_ok=True)  # accepts str; JOB_ROOT_PATH used where Path needed
 
 app = FastAPI(title="FMAP-AI API", version=APP_VERSION)
 
@@ -72,7 +75,7 @@ JOBS: Dict[str, Dict[str, Any]] = {}
 STATE_FILENAME = "job_state.json"
 
 def _job_dir_for(job_id: str) -> Path:
-    return JOB_ROOT / job_id
+    return JOB_ROOT_PATH / job_id
 
 def _persist_job_state(job_id: str) -> None:
     try:
