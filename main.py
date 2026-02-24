@@ -21,6 +21,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field, model_validator
 
+import logging
+import threading
+
 from fmap_download import run_download_pipeline, ncss_point_csv, GRIDMET_DATASETS, spi_gamma_monthly
 from fmap_analysis import run_analysis, build_manifest
 
@@ -63,6 +66,75 @@ app.add_middleware(
 
 # Simple in-memory job store (sufficient for a single Render instance)
 JOBS: Dict[str, Dict[str, Any]] = {}
+
+# ----------------------------
+# Debug / instrumentation
+# ----------------------------
+LOG_LEVEL = os.getenv("FMAP_LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format='%(asctime)s %(levelname)s %(message)s',
+)
+_logger = logging.getLogger("fmap")
+
+
+def _job_log_path(job_dir: str) -> str:
+    return os.path.join(job_dir, "job.log")
+
+
+def _append_job_log(job_dir: str, line: str) -> None:
+    try:
+        os.makedirs(job_dir, exist_ok=True)
+        with open(_job_log_path(job_dir), "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def _job_event(job_id: str, stage: str, message: str = "", **extra: Any) -> None:
+    meta = JOBS.get(job_id)
+    job_dir = _job_dir(job_id)
+    ts = _utc_now()
+
+    if meta is not None:
+        meta["stage"] = stage
+        meta["message"] = message
+        meta["last_update_at"] = ts
+        meta["last_update_epoch"] = time.time()
+        if extra:
+            meta.setdefault("extra", {}).update(extra)
+
+    line = f"{ts} [{job_id}] [{stage}] {message}".rstrip()
+    _logger.info(line)
+    _append_job_log(job_dir, line)
+
+
+def _start_heartbeat(job_id: str, interval_seconds: int = 30) -> threading.Event:
+    stop = threading.Event()
+
+    def _beat():
+        while not stop.wait(interval_seconds):
+            meta = JOBS.get(job_id)
+            if not meta:
+                return
+            if meta.get("status") in ("done", "error"):
+                return
+            meta["last_heartbeat_at"] = _utc_now()
+
+    threading.Thread(target=_beat, daemon=True).start()
+    return stop
+
+
+def _tail_text_file(path: str, max_lines: int = 200) -> str:
+    try:
+        if not os.path.exists(path):
+            return ""
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        return "".join(lines[-max_lines:])
+    except Exception:
+        return ""
+
 
 
 def _utc_now() -> str:
@@ -246,8 +318,13 @@ class RunResponse(BaseModel):
 class StatusResponse(BaseModel):
     job_id: str
     status: str
+    stage: Optional[str] = None
+    message: Optional[str] = None
     started_at: str
     finished_at: Optional[str] = None
+    elapsed_seconds: Optional[float] = None
+    last_update_at: Optional[str] = None
+    last_heartbeat_at: Optional[str] = None
     error: Optional[str] = None
 
 
@@ -274,7 +351,12 @@ def _run_job(job_id: str, req: RunRequest) -> None:
         }
     )
 
+    hb_stop = _start_heartbeat(job_id)
+    _job_event(job_id, "job:start", "Job started")
+
     try:
+        _job_event(job_id, "download:start", "Starting download pipeline")
+
         download_meta = run_download_pipeline(
             job_dir=job_dir,
             pt_lon=req.pt_lon,
@@ -297,7 +379,11 @@ def _run_job(job_id: str, req: RunRequest) -> None:
                 "limit products, or run on an instance with persistent disk."
             )
 
+        _job_event(job_id, "download:done", "Download pipeline finished")
+
+        _job_event(job_id, "analysis:start", "Starting analysis")
         analysis = run_analysis(job_dir=job_dir, request=req.model_dump(), download_meta=download_meta)
+        _job_event(job_id, "analysis:done", "Analysis finished")
 
         # --- Optional time-series products (point and/or region) ---
         ts_warnings: List[str] = []
@@ -318,7 +404,9 @@ def _run_job(job_id: str, req: RunRequest) -> None:
             if isinstance(analysis, dict):
                 analysis["timeseries"] = {"available": False, "warnings": [f"Time series packaging failed: {e}"]}
         # Prune intermediates and (optionally) large rasters to keep temp storage under control.
+        _job_event(job_id, "prune:start", "Pruning intermediates")
         prune_report = _prune_job_dir(job_dir, keep_rasters=req.keep_rasters, keep_zip=req.include_zip)
+        _job_event(job_id, "prune:done", f"Prune complete (after_bytes={prune_report.get('after_bytes')})")
         JOBS[job_id]["prune_report"] = prune_report
         if prune_report.get("after_bytes", 0) > MAX_JOB_BYTES:
             raise RuntimeError(
@@ -338,7 +426,11 @@ def _run_job(job_id: str, req: RunRequest) -> None:
                     "Refusing to build ZIP because outputs are too large for safe zipping on this instance "
                     f"({bytes_for_zip/1024**2:.1f} MB). Try keep_rasters=false or reduce bbox/size_px."
                 )
+            _job_event(job_id, "zip:start", "Building outputs zip")
             zip_path = shutil.make_archive(os.path.join(job_dir, f"{job_id}_outputs"), "zip", job_dir)
+            _job_event(job_id, "zip:done", "ZIP ready")
+
+        _job_event(job_id, "job:done", "Job finished successfully")
 
         JOBS[job_id].update(
             {
@@ -353,6 +445,8 @@ def _run_job(job_id: str, req: RunRequest) -> None:
     except Exception as e:
         err = f"{type(e).__name__}: {str(e)}"
         tb = traceback.format_exc(limit=10)
+        _job_event(job_id, "job:error", err)
+
         JOBS[job_id].update(
             {
                 "status": "error",
@@ -366,6 +460,14 @@ def _run_job(job_id: str, req: RunRequest) -> None:
         try:
             _safe_rmtree(job_dir)
             JOBS[job_id]["job_dir_cleaned"] = True
+        except Exception:
+            pass
+
+
+    finally:
+        try:
+            hb_stop.set()
+            JOBS[job_id]["last_heartbeat_at"] = _utc_now()
         except Exception:
             pass
 
@@ -452,11 +554,21 @@ def status(job_id: str):
     meta = JOBS.get(job_id)
     if not meta:
         raise HTTPException(status_code=404, detail="Unknown job_id")
+    elapsed = None
+    try:
+        elapsed = float(time.time() - float(meta.get("started_epoch", time.time())))
+    except Exception:
+        elapsed = None
     return StatusResponse(
         job_id=job_id,
         status=meta.get("status", "unknown"),
+        stage=meta.get("stage"),
+        message=meta.get("message"),
         started_at=meta.get("started_at"),
         finished_at=meta.get("finished_at"),
+        elapsed_seconds=elapsed,
+        last_update_at=meta.get("last_update_at"),
+        last_heartbeat_at=meta.get("last_heartbeat_at"),
         error=meta.get("error"),
     )
 
@@ -497,6 +609,22 @@ def download(job_id: str):
 
     return FileResponse(zip_path, media_type="application/zip", filename=os.path.basename(zip_path))
 
+
+
+
+@app.get("/fmap/debug/{job_id}")
+def debug_job(job_id: str, tail: int = 200) -> Dict[str, Any]:
+    """Lightweight debug endpoint: returns job meta + tail of per-job log."""
+    meta = JOBS.get(job_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Unknown job_id")
+
+    job_dir = meta.get("job_dir") or _job_dir(job_id)
+    log_tail = _tail_text_file(_job_log_path(job_dir), max_lines=max(10, min(int(tail), 2000)))
+
+    # Avoid returning huge blobs
+    safe_meta = {k: v for k, v in meta.items() if k not in ("analysis", "manifest")}
+    return {"job_id": job_id, "meta": safe_meta, "log_tail": log_tail}
 
 # ----------------------------
 # Time series helpers / API
