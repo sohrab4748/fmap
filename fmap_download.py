@@ -783,11 +783,16 @@ def run_download_pipeline(
             meta[f"gridmet_{k}_var"] = None
 
     # Optional bbox netcdf example (tmmx)
-    try:
-        out_nc = os.path.join(job_dir, "gridmet_tmmx_bbox.nc")
-        _, used_var = ncss_bbox_netcdf("tmmx", GRIDMET_DATASETS["tmmx"]["vars"], bbox_lonlat, date_start, date_end, out_nc)
-        meta["gridmet_tmmx_bbox_var"] = used_var
-    except Exception:
+    # Disabled by default to avoid exceeding Render /tmp limits.
+    # Enable only if you really need the bbox netcdf: set FMAP_ENABLE_BBOX_NC=1
+    if os.getenv("FMAP_ENABLE_BBOX_NC", "0").strip().lower() in ("1", "true", "yes"):
+        try:
+            out_nc = os.path.join(job_dir, "gridmet_tmmx_bbox.nc")
+            _, used_var = ncss_bbox_netcdf("tmmx", GRIDMET_DATASETS["tmmx"]["vars"], bbox_lonlat, date_start, date_end, out_nc)
+            meta["gridmet_tmmx_bbox_var"] = used_var
+        except Exception:
+            meta["gridmet_tmmx_bbox_var"] = None
+    else:
         meta["gridmet_tmmx_bbox_var"] = None
 
     # Cleaned climate csv
