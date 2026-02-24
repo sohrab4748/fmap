@@ -16,13 +16,15 @@ import shutil
 import traceback
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, List, Literal, Tuple
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field, model_validator
 
 import logging
 import threading
+import io
+import faulthandler
 
 from fmap_download import run_download_pipeline, ncss_point_csv, GRIDMET_DATASETS, spi_gamma_monthly
 from fmap_analysis import run_analysis, build_manifest
@@ -76,6 +78,18 @@ logging.basicConfig(
     format='%(asctime)s %(levelname)s %(message)s',
 )
 _logger = logging.getLogger("fmap")
+
+# Optional debug key to protect debug/stack endpoints.
+# If set, callers must send header: X-DEBUG-KEY: <value>
+DEBUG_KEY = os.getenv("FMAP_DEBUG_KEY", "").strip()
+
+
+def _require_debug_key(req: Request) -> None:
+    if not DEBUG_KEY:
+        return
+    got = (req.headers.get("X-DEBUG-KEY") or "").strip()
+    if got != DEBUG_KEY:
+        raise HTTPException(status_code=401, detail="Missing/invalid debug key")
 
 
 def _job_log_path(job_dir: str) -> str:
@@ -134,6 +148,56 @@ def _tail_text_file(path: str, max_lines: int = 200) -> str:
         return "".join(lines[-max_lines:])
     except Exception:
         return ""
+
+
+
+def _tmp_usage_mb() -> Dict[str, float]:
+    """Best-effort /tmp usage snapshot (MB)."""
+    try:
+        total, used, free = shutil.disk_usage("/tmp")
+        return {
+            "tmp_total_mb": round(total / 1024 / 1024, 1),
+            "tmp_used_mb": round(used / 1024 / 1024, 1),
+            "tmp_free_mb": round(free / 1024 / 1024, 1),
+        }
+    except Exception:
+        return {}
+
+
+def _largest_files(job_dir: str, top_n: int = 8) -> List[Dict[str, Any]]:
+    """Return largest files under job_dir (relative path + MB)."""
+    rows: List[Dict[str, Any]] = []
+    try:
+        for root, _dirs, files in os.walk(job_dir):
+            for fn in files:
+                fp = os.path.join(root, fn)
+                try:
+                    sz = os.path.getsize(fp)
+                except Exception:
+                    continue
+                rel = os.path.relpath(fp, job_dir)
+                rows.append({"path": rel, "mb": round(sz / 1024 / 1024, 2)})
+        rows.sort(key=lambda r: r["mb"], reverse=True)
+        return rows[: max(1, min(int(top_n), 50))]
+    except Exception:
+        return []
+
+
+def _clean_success_outputs(job_dir: str) -> None:
+    """Remove heavy outputs after success (keeps job.log)."""
+    keep = {"job.log"}
+    try:
+        for root, _dirs, files in os.walk(job_dir):
+            for fn in files:
+                if fn in keep:
+                    continue
+                fp = os.path.join(root, fn)
+                try:
+                    os.remove(fp)
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 
 
@@ -283,7 +347,7 @@ class RunRequest(BaseModel):
 
     # Output controls
     include_zip: bool = Field(False, description="If true, prepare a zip and expose /fmap/download/{job_id}")
-    keep_rasters: bool = Field(True, description="If false, remove .tif/.nc after analysis")
+    keep_rasters: bool = Field(False, description="If false, remove .tif/.nc after analysis (recommended on Render free tier)")
 
     # Selection mode:
     # - "point": compute time series for the single point (pt_lon/pt_lat)
@@ -372,12 +436,37 @@ def _run_job(job_id: str, req: RunRequest) -> None:
         # Storage guardrail (Render free instances can be evicted near ~2GB temp usage).
         bytes_after_download = _dir_size_bytes(job_dir)
         JOBS[job_id]["job_dir_bytes_after_download"] = int(bytes_after_download)
+
+        # Record disk snapshot + biggest files (helps diagnose /tmp evictions).
+        try:
+            JOBS[job_id]["tmp_usage_after_download"] = _tmp_usage_mb()
+            JOBS[job_id]["largest_files_after_download"] = _largest_files(job_dir, top_n=8)
+        except Exception:
+            pass
+
         if bytes_after_download > MAX_JOB_BYTES:
-            raise RuntimeError(
-                "Job outputs exceeded the instance storage guardrail after download "
-                f"({bytes_after_download/1024**2:.1f} MB). Reduce bbox/size_px, "
-                "limit products, or run on an instance with persistent disk."
+            # Try an emergency prune even if the caller requested keep_rasters=true.
+            _job_event(
+                job_id,
+                "storage:limit",
+                f"Outputs exceed guardrail after download ({bytes_after_download/1024**2:.1f} MB). Pruning large intermediates.",
             )
+            prune_limit = _prune_job_dir(job_dir, keep_rasters=False, keep_zip=req.include_zip)
+            JOBS[job_id]["prune_report_limit"] = prune_limit
+            bytes_after_download = int(prune_limit.get("after_bytes", bytes_after_download))
+            JOBS[job_id]["job_dir_bytes_after_download_pruned"] = int(bytes_after_download)
+            try:
+                JOBS[job_id]["tmp_usage_after_download_pruned"] = _tmp_usage_mb()
+                JOBS[job_id]["largest_files_after_download_pruned"] = _largest_files(job_dir, top_n=8)
+            except Exception:
+                pass
+
+            if bytes_after_download > MAX_JOB_BYTES:
+                raise RuntimeError(
+                    "Job outputs exceeded the instance storage guardrail after download "
+                    f"({bytes_after_download/1024**2:.1f} MB). Reduce bbox/size_px, "
+                    "set keep_rasters=false, or run on an instance with persistent disk."
+                )
 
         _job_event(job_id, "download:done", "Download pipeline finished")
 
@@ -441,6 +530,19 @@ def _run_job(job_id: str, req: RunRequest) -> None:
                 "zip_path": zip_path,
             }
         )
+
+
+        # Optional: reclaim disk immediately on success when no ZIP is requested.
+        # Set FMAP_CLEAN_ON_SUCCESS=1 on Render to keep the service from being evicted due to /tmp growth.
+        if (not req.include_zip) and os.getenv("FMAP_CLEAN_ON_SUCCESS", "0").strip().lower() in ("1", "true", "yes"):
+            _job_event(job_id, "cleanup:success", "Cleaning success outputs (keeping job.log)")
+            _clean_success_outputs(job_dir)
+            try:
+                JOBS[job_id]["tmp_usage_after_cleanup"] = _tmp_usage_mb()
+                JOBS[job_id]["job_dir_bytes_after_cleanup"] = int(_dir_size_bytes(job_dir))
+            except Exception:
+                pass
+
 
     except Exception as e:
         err = f"{type(e).__name__}: {str(e)}"
@@ -613,8 +715,9 @@ def download(job_id: str):
 
 
 @app.get("/fmap/debug/{job_id}")
-def debug_job(job_id: str, tail: int = 200) -> Dict[str, Any]:
+def debug_job(job_id: str, req: Request, tail: int = 200) -> Dict[str, Any]:
     """Lightweight debug endpoint: returns job meta + tail of per-job log."""
+    _require_debug_key(req)
     meta = JOBS.get(job_id)
     if not meta:
         raise HTTPException(status_code=404, detail="Unknown job_id")
@@ -625,6 +728,35 @@ def debug_job(job_id: str, tail: int = 200) -> Dict[str, Any]:
     # Avoid returning huge blobs
     safe_meta = {k: v for k, v in meta.items() if k not in ("analysis", "manifest")}
     return {"job_id": job_id, "meta": safe_meta, "log_tail": log_tail}
+
+
+@app.get("/fmap/stack/{job_id}")
+def debug_stack(job_id: str, req: Request, max_chars: int = 60000) -> Dict[str, Any]:
+    """Dump stack traces of all threads (useful when a job looks 'stuck').
+
+    Security: if FMAP_DEBUG_KEY is set, callers must provide X-DEBUG-KEY.
+    """
+    _require_debug_key(req)
+    meta = JOBS.get(job_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Unknown job_id")
+
+    buf = io.StringIO()
+    try:
+        faulthandler.dump_traceback(file=buf, all_threads=True)
+        txt = buf.getvalue()
+    except Exception as e:
+        txt = f"Unable to dump stack traces: {e}"
+
+    # Avoid returning huge payloads
+    try:
+        mc = int(max_chars)
+    except Exception:
+        mc = 60000
+    txt = txt[-max(1000, min(mc, 200000)) :]
+
+    safe_meta = {k: v for k, v in meta.items() if k not in ("analysis", "manifest")}
+    return {"job_id": job_id, "meta": safe_meta, "stack": txt}
 
 # ----------------------------
 # Time series helpers / API
