@@ -246,40 +246,122 @@ def gridmet_decode_temp_C(series: pd.Series, dataset_id: str, varname: Optional[
 # -------------------------
 
 def _spi_from_gamma(x_values, a, scale, p0):
-    g = gamma.cdf(x_values, a, loc=0, scale=scale)
-    H = p0 + (1.0 - p0) * g
+    # Gamma mixture with probability of zero.
+    # x_values may include zeros/negatives; gamma.cdf handles negatives as 0.
+    g = gamma.cdf(np.asarray(x_values, dtype=float), a, loc=0, scale=scale)
+    H = float(p0) + (1.0 - float(p0)) * g
     H = np.clip(H, 1e-6, 1.0 - 1e-6)
     return norm.ppf(H)
 
+
+def _fit_gamma_safe(x_pos: np.ndarray):
+    """
+    Robust gamma fit for SPI.
+    Returns (shape, scale) or None.
+    Uses MLE when possible; falls back to method-of-moments.
+    """
+    x_pos = np.asarray(x_pos, dtype=float)
+    x_pos = x_pos[np.isfinite(x_pos) & (x_pos > 0)]
+    if x_pos.size < 3:
+        return None
+
+    # Try MLE
+    try:
+        a, loc, scale = gamma.fit(x_pos, floc=0)
+        if np.isfinite(a) and np.isfinite(scale) and a > 0 and scale > 0:
+            return float(a), float(scale)
+    except Exception:
+        pass
+
+    # Method of moments fallback (works even when MLE struggles)
+    mean = float(np.mean(x_pos))
+    var = float(np.var(x_pos, ddof=1)) if x_pos.size >= 2 else float("nan")
+    if not (np.isfinite(mean) and np.isfinite(var)) or mean <= 0 or var <= 0:
+        return None
+    a = (mean * mean) / var
+    scale = var / mean
+    if np.isfinite(a) and np.isfinite(scale) and a > 0 and scale > 0:
+        return float(a), float(scale)
+    return None
+
+
+def _spi_fallback_zscore(x_values: np.ndarray) -> np.ndarray:
+    """
+    Non-parametric fallback: z-score on the rolling sums for that month.
+    Not a true SPI, but prevents pipeline failure when gamma fit is unstable.
+    """
+    v = np.asarray(x_values, dtype=float)
+    v = np.where(np.isfinite(v), v, np.nan)
+    mu = float(np.nanmean(v)) if np.isfinite(np.nanmean(v)) else 0.0
+    sd = float(np.nanstd(v)) if np.isfinite(np.nanstd(v)) else 0.0
+    if sd <= 0 or not np.isfinite(sd):
+        return np.zeros_like(v, dtype=float)
+    z = (v - mu) / sd
+    return np.clip(z, -5.0, 5.0)
+
+
 def spi_gamma_monthly(series: pd.Series, window=30, min_samples_per_month=60, fallback_to_pooled=True) -> pd.Series:
-    x = series.rolling(window=window, min_periods=window).sum()
-    spi = pd.Series(index=series.index, data=np.nan, dtype="float32")
+    """
+    Rolling-sum SPI using a monthly Gamma fit with a zero-probability mixture.
+
+    This implementation is hardened against:
+      - constant/near-constant samples (MLE can fail),
+      - occasional non-finite values,
+      - upstream fill values (negative precipitation) – treated as missing.
+
+    If Gamma fit fails, falls back to pooled params, then to a z-score approximation.
+    """
+    s = pd.to_numeric(series, errors="coerce")
+    # Precip should be non-negative; treat negative as missing (often fill values).
+    s = s.where(s >= 0)
+
+    x = s.rolling(window=window, min_periods=window).sum()
+    spi = pd.Series(index=s.index, data=np.nan, dtype="float32")
 
     pooled_params = None
     if fallback_to_pooled:
         x_valid = x.dropna()
         if len(x_valid) >= 12 * min_samples_per_month:
-            p0p = float((x_valid.values <= 0).mean())
-            x_fitp = x_valid[x_valid > 0].values
-            if len(x_fitp) >= max(120, 2 * min_samples_per_month):
-                ap, locp, scalep = gamma.fit(x_fitp, floc=0)
-                pooled_params = (ap, scalep, p0p)
+            xv = x_valid.values.astype(float)
+            xv = xv[np.isfinite(xv)]
+            if xv.size >= 12 * min_samples_per_month:
+                p0p = float((xv <= 0).mean())
+                x_fitp = xv[xv > 0]
+                params = _fit_gamma_safe(x_fitp)
+                if params is not None and x_fitp.size >= max(120, 2 * min_samples_per_month):
+                    ap, scalep = params
+                    pooled_params = (ap, scalep, p0p)
 
-    for m in range(1, 13):
-        sel = (x.index.month == m) & x.notna()
+    for mo in range(1, 13):
+        sel = (x.index.month == mo) & x.notna()
         x_m = x[sel]
         if x_m.empty:
             continue
 
-        p0 = float((x_m.values <= 0).mean())
-        x_fit = x_m[x_m > 0].values
+        xv = x_m.values.astype(float)
+        xv = xv[np.isfinite(xv)]
+        if xv.size == 0:
+            continue
 
-        if len(x_m) >= min_samples_per_month and len(x_fit) >= max(30, min_samples_per_month // 3):
-            a, loc, scale = gamma.fit(x_fit, floc=0)
-            spi.loc[sel] = _spi_from_gamma(x_m.values, a, scale, p0).astype("float32")
-        elif pooled_params is not None:
+        p0 = float((xv <= 0).mean())
+        x_fit = xv[xv > 0]
+
+        # Try month-specific gamma
+        if xv.size >= min_samples_per_month and x_fit.size >= max(30, min_samples_per_month // 3):
+            params = _fit_gamma_safe(x_fit)
+            if params is not None:
+                a, scale = params
+                spi.loc[sel] = _spi_from_gamma(x_m.values, a, scale, p0).astype("float32")
+                continue
+
+        # Fallback to pooled gamma
+        if pooled_params is not None:
             ap, scalep, p0p = pooled_params
             spi.loc[sel] = _spi_from_gamma(x_m.values, ap, scalep, p0p).astype("float32")
+            continue
+
+        # Final fallback: z-score approximation (prevents hard failure)
+        spi.loc[sel] = _spi_fallback_zscore(x_m.values).astype("float32")
 
     return spi
 
