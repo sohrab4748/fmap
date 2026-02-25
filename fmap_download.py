@@ -1099,12 +1099,12 @@ def run_download_pipeline(
     df_srad = clim_point.get("srad")
 
     t = _time_axis(df_pr)
-if t is None:
-    t = _time_axis(df_tx)
-if t is None:
-    t = _time_axis(df_tn)
-if t is None:
-    t = _time_axis(df_vpd)
+    if t is None:
+        t = _time_axis(df_tx)
+    if t is None:
+        t = _time_axis(df_tn)
+    if t is None:
+        t = _time_axis(df_vpd)
     if t is None:
         raise RuntimeError("Could not build climate time axis (no 'time' column in GridMET point outputs)")
 
@@ -1394,7 +1394,7 @@ if t is None:
         meta["lcms_fastloss_layer_name"] = None
         meta["lcms_fastloss_point"] = None
 
-# Carbon loss proxy (placeholder): C * (MTBS != 0)
+    # Carbon loss proxy (placeholder): C * (MTBS != 0)
     try:
         if os.path.exists(agc_mg_tif) and os.path.exists(mtbs_tif):
             with rasterio.open(agc_mg_tif) as srcC:
