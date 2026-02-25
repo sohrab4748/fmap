@@ -28,7 +28,6 @@ import faulthandler
 
 from fmap_download import run_download_pipeline, ncss_point_csv, GRIDMET_DATASETS, spi_gamma_monthly
 from fmap_analysis import run_analysis, build_manifest
-from fmap_gemini import interpret_with_gemini
 
 APP_VERSION = "0.1.1"
 JOB_ROOT = os.getenv("FMAP_JOB_ROOT", "/tmp/fmap_jobs")
@@ -226,6 +225,110 @@ def _dir_size_bytes(path: str) -> int:
     return total
 
 
+
+# -----------------------------------------------------------------------------
+# Description file (human-readable catalog) per job
+# -----------------------------------------------------------------------------
+DESCRIPTION_FILENAME = os.getenv("FMAP_DESCRIPTION_FILENAME", "description.txt")
+
+
+def _job_description_path(job_dir: str) -> str:
+    return os.path.join(job_dir, DESCRIPTION_FILENAME)
+
+
+def _classify_output_item(relpath: str) -> Dict[str, str]:
+    """Heuristic classification for job output items."""
+    p = relpath.lower()
+    if p.endswith(".json") and "analysis_result" in p:
+        return {"type": "analysis", "desc": "Main analysis summary consumed by the frontend (charts/cards)."}
+    if p.endswith(".csv") and "climate_point" in p:
+        return {"type": "download+clean", "desc": "GridMET point time series (downloaded via NCSS) after cleaning/units fixes."}
+    if p.endswith(".csv") and "spi" in p:
+        return {"type": "computed", "desc": "SPI time series computed from precipitation."}
+    if p.endswith(".geojson"):
+        return {"type": "download", "desc": "Vector output (e.g., fire perimeters) clipped to bbox."}
+    if p.endswith(".tif") or p.endswith(".tiff"):
+        if "ndvi" in p or "ndmi" in p or "nbr" in p:
+            return {"type": "computed", "desc": "Vegetation index raster derived from Landsat over bbox."}
+        if "nlcd" in p or "canopy" in p:
+            return {"type": "download", "desc": "NLCD landcover/canopy raster fetched for bbox (used for forest mask/canopy)."}
+        if "mtbs" in p or "burn" in p or "dnbr" in p or "severity" in p:
+            return {"type": "download", "desc": "Burn severity / fire raster for bbox (when available)."}
+        if "agb" in p or "carbon" in p or "fia" in p:
+            return {"type": "download", "desc": "Biomass/carbon raster for bbox (point + forest distributions)."}
+        return {"type": "download", "desc": "Raster output for bbox (source-dependent)."}
+    if p.endswith(".log") or "state.json" in p:
+        return {"type": "debug", "desc": "Debug metadata/logs for troubleshooting."}
+    if p.endswith(".zip"):
+        return {"type": "bundle", "desc": "ZIP bundle of job outputs."}
+    if p.endswith(".txt") and "description" in p:
+        return {"type": "documentation", "desc": "Human-readable description of outputs and chart meanings."}
+    return {"type": "output", "desc": "Job output file."}
+
+
+def _write_description_txt(job_id: str, job_dir: str, request_dict: Dict[str, Any]) -> str:
+    """Create/update a per-job description.txt inside the job directory."""
+    # Collect current files in job_dir (relative paths)
+    rel_files: List[str] = []
+    for root, _dirs, files in os.walk(job_dir):
+        for fn in files:
+            fp = os.path.join(root, fn)
+            rel = os.path.relpath(fp, job_dir)
+            # Skip the job zip if present (can be huge and redundant)
+            if rel.lower().endswith(".zip") and rel.startswith(job_id):
+                continue
+            rel_files.append(rel)
+    rel_files = sorted(rel_files)
+
+    # Build documentation
+    lines: List[str] = []
+    lines.append("FMAP-AI — Outputs & Chart Guide")
+    lines.append(f"Job ID: {job_id}")
+    lines.append(f"Generated (UTC): {_utc_now()}")
+    lines.append("")
+    lines.append("A) What this run does")
+    lines.append("  - Downloads point/bbox subsets from public datasets (GridMET + optional remote-sensing layers).")
+    lines.append("  - Computes derived indices (SPI, vegetation indices, fire-weather indices when enabled).")
+    lines.append("  - Summarizes forest/disturbance context (landcover, canopy, biomass/carbon, fire products when available).")
+    lines.append("  - Packages results for the web dashboard and optional ZIP download.")
+    lines.append("")
+    lines.append("B) Run inputs")
+    for k in [
+        "pt_lon","pt_lat","minlon","minlat","maxlon","maxlat",
+        "date_start","date_end","spi_start","cloud_cover_lt",
+        "keep_rasters","include_zip","size_px","selection"
+    ]:
+        if k in request_dict:
+            lines.append(f"  - {k}: {request_dict[k]}")
+    lines.append("")
+    lines.append("C) Charts in the dashboard (how to interpret)")
+    lines.append("  - Climate/Weather: precipitation + temperature series; optional SPI for drought context.")
+    lines.append("  - Vegetation (Landsat): NDVI/NDMI/NBR indicate greenness, moisture stress, and burn/disturbance signal.")
+    lines.append("  - Landcover/Canopy: forest mask and canopy % (if NLCD services are available).")
+    lines.append("  - Burn/Fire: fire perimeters/burned area; burn severity if MTBS coverage exists.")
+    lines.append("  - Biomass/Carbon: AGB/AGC point + forest-only distributions in the bbox.")
+    lines.append("  - Fire/Forest Weather (GridMET-only, if enabled): KBDI, VPD, ETo, wind, HDW proxy, fuel moisture, ERC/BI.")
+    lines.append("")
+    lines.append("D) ZIP / output items produced by this run")
+    if not rel_files:
+        lines.append("  (No files found in job directory.)")
+    else:
+        for rel in rel_files:
+            meta = _classify_output_item(rel)
+            lines.append(f"  - {rel} | type={meta['type']} | {meta['desc']}")
+    lines.append("")
+    lines.append("E) Notes on missing/empty panels")
+    lines.append("  - Some panels require specific data availability (e.g., NLCD WCS can be temporarily 503).")
+    lines.append("  - Fire/burn panels can be empty if no fires intersect the bbox for the selected period.")
+    lines.append("  - Distribution/histogram panels require bbox raster sampling; point-only runs may only show point/bbox mean.")
+    lines.append("")
+
+    path = _job_description_path(job_dir)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return path
+
+
 def _safe_rmtree(path: str) -> None:
     try:
         if path and os.path.exists(path):
@@ -401,18 +504,8 @@ class ResultResponse(BaseModel):
     analysis: Dict[str, Any]
     manifest: Dict[str, Any]
     download_url: Optional[str] = None
+    description_url: Optional[str] = None
 
-
-
-class GeminiRequest(BaseModel):
-    job_id: str = Field(..., description="FMAP job id")
-    mode: str = Field("technical", description="technical | executive | public")
-    extra: Optional[str] = Field(None, description="Optional user notes / question")
-
-class GeminiResponse(BaseModel):
-    job_id: str
-    mode: str
-    text: str
 
 def _run_job(job_id: str, req: RunRequest) -> None:
     job_dir = _job_dir(job_id)
@@ -516,6 +609,12 @@ def _run_job(job_id: str, req: RunRequest) -> None:
                 "Try keep_rasters=false, reduce bbox/size_px, or upgrade to a persistent-disk instance."
             )
 
+# Write a human-readable description file for this job (used by the frontend as a link).
+try:
+    desc_path = _write_description_txt(job_id, job_dir, req.model_dump())
+    JOBS[job_id]["description_path"] = desc_path
+except Exception as e:
+    _job_event(job_id, "description:warn", f"Failed to write description.txt: {e}")
         manifest = build_manifest(job_dir)
 
         # Optionally build zip for user download (zipping duplicates bytes temporarily).
@@ -627,6 +726,7 @@ def run(req: RunRequest, background: BackgroundTasks):
         started_at=JOBS[job_id]["started_at"],
         result_url=f"/fmap/result/{job_id}",
         download_url=download_url,
+        description_url=description_url,
     )
 
 
@@ -650,8 +750,11 @@ def run_sync(req: RunRequest):
 
     if meta["status"] == "error":
         raise HTTPException(status_code=500, detail={"error": meta.get("error"), "traceback": meta.get("traceback")})
-
     download_url = f"/fmap/download/{job_id}" if meta.get("zip_path") else None
+    # Description file is always generated for successful jobs (if present).
+    job_dir = meta.get("job_dir")
+    desc_path = _job_description_path(job_dir) if job_dir else None
+    description_url = f"/fmap/description/{job_id}" if (desc_path and os.path.exists(desc_path)) else None
     return ResultResponse(
         job_id=job_id,
         status=meta["status"],
@@ -711,32 +814,6 @@ def result(job_id: str):
     )
 
 
-
-@app.get("/fmap/analysis_result/{job_id}")
-def analysis_result(job_id: str):
-    """Return analysis_result.json content for a finished job (same payload as ResultResponse.analysis)."""
-    meta = JOBS.get(job_id)
-    if not meta:
-        raise HTTPException(status_code=404, detail="Unknown job_id")
-
-    if meta.get("status") in ("queued", "running"):
-        raise HTTPException(status_code=409, detail={"status": meta.get("status"), "message": "Not finished yet. Use /fmap/status."})
-
-    if meta.get("status") == "error":
-        raise HTTPException(status_code=500, detail={"error": meta.get("error"), "traceback": meta.get("traceback")})
-
-    a = meta.get("analysis")
-    if isinstance(a, dict) and a:
-        return a
-
-    job_dir = meta.get("job_dir") or _job_dir(job_id)
-    p = os.path.join(job_dir, "analysis_result.json")
-    if os.path.exists(p):
-        return FileResponse(p, media_type="application/json", filename="analysis_result.json")
-
-    return {}
-
-
 @app.get("/fmap/download/{job_id}")
 def download(job_id: str):
     meta = JOBS.get(job_id)
@@ -751,6 +828,24 @@ def download(job_id: str):
 
 
 
+
+@app.get("/fmap/description/{job_id}")
+def description(job_id: str):
+    meta = JOBS.get(job_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Unknown job_id")
+
+    if meta.get("status") in ("queued", "running"):
+        raise HTTPException(status_code=409, detail={"status": meta.get("status"), "message": "Not finished yet. Use /fmap/status."})
+
+    if meta.get("status") == "error":
+        raise HTTPException(status_code=500, detail={"error": meta.get("error"), "traceback": meta.get("traceback")})
+
+    job_dir = meta.get("job_dir") or _job_dir(job_id)
+    path = _job_description_path(job_dir)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="description.txt not available for this job.")
+    return FileResponse(path, media_type="text/plain; charset=utf-8", filename=DESCRIPTION_FILENAME)
 
 @app.get("/fmap/debug/{job_id}")
 def debug_job(job_id: str, req: Request, tail: int = 200) -> Dict[str, Any]:
@@ -795,29 +890,6 @@ def debug_stack(job_id: str, req: Request, max_chars: int = 60000) -> Dict[str, 
 
     safe_meta = {k: v for k, v in meta.items() if k not in ("analysis", "manifest")}
     return {"job_id": job_id, "meta": safe_meta, "stack": txt}
-
-
-@app.post("/ai/gemini", response_model=GeminiResponse)
-def ai_gemini(req: GeminiRequest):
-    """Server-side Gemini interpretation of analysis_result (requires GEMINI_API_KEY env var)."""
-    meta = JOBS.get(req.job_id)
-    if not meta:
-        raise HTTPException(status_code=404, detail="Unknown job_id")
-
-    if meta.get("status") in ("queued", "running"):
-        raise HTTPException(status_code=409, detail={"status": meta.get("status"), "message": "Not finished yet. Use /fmap/status."})
-
-    if meta.get("status") == "error":
-        raise HTTPException(status_code=500, detail={"error": meta.get("error"), "traceback": meta.get("traceback")})
-
-    analysis = meta.get("analysis") or {}
-    try:
-        model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
-        txt = interpret_with_gemini(analysis, mode=req.mode, model=model, extra=req.extra)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    return GeminiResponse(job_id=req.job_id, mode=req.mode, text=txt)
-
 
 # ----------------------------
 # Time series helpers / API
