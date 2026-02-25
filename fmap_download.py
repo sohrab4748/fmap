@@ -1098,7 +1098,13 @@ def run_download_pipeline(
     df_rmax = clim_point.get("rmax")
     df_srad = clim_point.get("srad")
 
-    t = _time_axis(df_pr) or _time_axis(df_tx) or _time_axis(df_tn) or _time_axis(df_vpd)
+    t = _time_axis(df_pr)
+if t is None:
+    t = _time_axis(df_tx)
+if t is None:
+    t = _time_axis(df_tn)
+if t is None:
+    t = _time_axis(df_vpd)
     if t is None:
         raise RuntimeError("Could not build climate time axis (no 'time' column in GridMET point outputs)")
 
