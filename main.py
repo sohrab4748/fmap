@@ -58,15 +58,23 @@ if allow_creds and not origins:
     raise RuntimeError("FMAP_CORS_ORIGINS is required when FMAP_CORS_ALLOW_CREDENTIALS=true")
 
 
+def _parse_origins():
+    v = (os.getenv("FMAP_CORS_ORIGINS") or "").strip()
+    if not v or v == "*":
+        return ["*"]
+    return [o.strip() for o in v.split(",") if o.strip()]
+
+origins = _parse_origins()
+allow_credentials = False if origins == ["*"] else True
+
 app.add_middleware(
     CORSMiddleware,
-    # Allow calls from any frontend origin (including file:// and custom domains).
-    # No cookies/credentials are used, so wildcard origins are safe here.
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=origins,
+    allow_credentials=allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # Simple in-memory job store (sufficient for a single Render instance)
 JOBS: Dict[str, Dict[str, Any]] = {}
