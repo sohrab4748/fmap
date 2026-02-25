@@ -627,19 +627,103 @@ def run_download_pipeline(
         "spi_start": spi_start,
     }
 
+
     # -------------------------
-    # 1) Landsat vegetation indices
+    # Landsat (for vegetation indices) — robust search with fallbacks.
+    # NOTE: This should NEVER hard-fail the whole job. If no scene is found,
+    # we record a warning and continue (other forest/climate outputs remain usable).
     # -------------------------
+    def _cloud_cover(it):
+        for k in ("eo:cloud_cover", "landsat:cloud_cover_land", "landsat:cloud_cover", "cloud_cover"):
+            v = it.properties.get(k)
+            try:
+                if v is not None:
+                    return float(v)
+            except Exception:
+                pass
+        return float("nan")
+
     catalog = _stac_client()
-    search = catalog.search(
-        collections=["landsat-c2-l2"],
-        bbox=list(bbox_lonlat),
-        datetime=f"{date_start}/{date_end}",
-        query={"eo:cloud_cover": {"lt": cloud_cover_lt}},
-    )
-    items = list(search.items())
+
+    # First attempt: server-side cloud filter (fast when property exists)
+    items = []
+    try:
+        search = catalog.search(
+            collections=["landsat-c2-l2"],
+            bbox=list(bbox_lonlat),
+            datetime=f"{date_start}/{date_end}",
+            query={"eo:cloud_cover": {"lt": cloud_cover_lt}},
+        )
+        items = list(search.items())
+    except Exception:
+        items = []
+
+    # Second attempt: same window, NO query (in case property is missing / query filters everything out)
     if not items:
-        raise RuntimeError("No Landsat scenes found. Try wider date range or larger bbox.")
+        try:
+            search = catalog.search(
+                collections=["landsat-c2-l2"],
+                bbox=list(bbox_lonlat),
+                datetime=f"{date_start}/{date_end}",
+            )
+            items = list(search.items())
+        except Exception:
+            items = []
+
+    # Third attempt: widen date window (last 365 days ending at date_end)
+    if not items:
+        try:
+            import datetime as _dt
+            _end = _dt.date.fromisoformat(date_end)
+            _start = _end - _dt.timedelta(days=365)
+            search = catalog.search(
+                collections=["landsat-c2-l2"],
+                bbox=list(bbox_lonlat),
+                datetime=f"{_start.isoformat()}/{_end.isoformat()}",
+            )
+            items = list(search.items())
+            if items:
+                meta.setdefault("warnings", []).append(
+                    f"No Landsat scene in requested window; using best scene in last 365 days ending {date_end}."
+                )
+        except Exception:
+            items = []
+
+    if not items:
+        meta["landsat_status"] = "none"
+        meta.setdefault("warnings", []).append(
+            "No Landsat scenes found for vegetation indices. NDVI/NDMI/NBR will be unavailable for this run."
+        )
+        # keep vegetation fields as None and continue the pipeline
+        meta["landsat_item_id"] = None
+        meta["landsat_cloud_cover"] = None
+        meta["landsat_datetime"] = None
+        meta["ndvi_point"] = None
+        meta["ndvi_mean_bbox"] = None
+        meta["ndmi_point"] = None
+        meta["ndmi_mean_bbox"] = None
+        meta["nbr_point"] = None
+        meta["nbr_mean_bbox"] = None
+        meta["ndvi_forest_mean_bbox"] = None
+        return meta
+
+    # Pick least-cloudy scene (fallback to recency when cloud is missing)
+    def _pick_key(it):
+        cc = _cloud_cover(it)
+        cc_key = cc if cc == cc else 999.0  # NaN last
+        dt = it.datetime
+        recency_key = -(dt.timestamp()) if dt else 0.0  # more recent first
+        return (cc_key, recency_key)
+
+    item = sorted(items, key=_pick_key)[0]
+    meta["landsat_status"] = "ok"
+    meta["landsat_item_id"] = item.id
+    cc = _cloud_cover(item)
+    meta["landsat_cloud_cover"] = float(cc) if cc == cc else None
+    try:
+        meta["landsat_datetime"] = (item.datetime.isoformat() if item.datetime else item.properties.get("datetime"))
+    except Exception:
+        meta["landsat_datetime"] = None
     item = sorted(items, key=lambda it: it.properties.get("eo:cloud_cover", 999))[0]
     meta["landsat_item_id"] = item.id
     meta["landsat_cloud_cover"] = float(item.properties.get("eo:cloud_cover", np.nan))
