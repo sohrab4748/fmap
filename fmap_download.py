@@ -199,6 +199,15 @@ _GRIDMET_DEFAULTS: Dict[tuple, tuple] = {
     ("tmmx", "daily_maximum_temperature"): (0.1, 220.0),  # K
     ("tmmn", "daily_minimum_temperature"): (0.1, 210.0),  # K
     ("vpd",  "daily_mean_vapor_pressure_deficit"): (0.01, 0.0),  # kPa
+    ("eto",  "eto"): (0.1, 0.0),   # mm
+    ("vs",   "vs"):  (0.1, 0.0),   # m/s
+    ("erc",  "erc"): (1.0, 0.0),   # NFDRS
+    ("bi",   "bi"):  (1.0, 0.0),   # NFDRS
+    ("fm100","fm100"): (0.1, 0.0), # %
+    ("fm1000","fm1000"): (0.1, 0.0), # %
+    ("rmin", "rmin"): (0.1, 0.0),  # %
+    ("rmax", "rmax"): (0.1, 0.0),  # %
+    ("srad", "srad"): (1.0, 0.0),  # W/m2
 }
 
 def gridmet_scale_offset(dataset_id: str, varname: str) -> tuple:
@@ -603,10 +612,22 @@ def wcs_getcoverage_geotiff(wcs_url: str, coverage_name: str, bbox_lonlat, out_t
 # -------------------------
 
 GRIDMET_DATASETS = {
+    # Core climate
     "pr":   {"dataset_id": "pr",   "vars": ["precipitation_amount", "pr"]},
     "tmmx": {"dataset_id": "tmmx", "vars": ["daily_maximum_temperature", "tmmx"]},
     "tmmn": {"dataset_id": "tmmn", "vars": ["daily_minimum_temperature", "tmmn"]},
     "vpd":  {"dataset_id": "vpd",  "vars": ["daily_mean_vapor_pressure_deficit", "mean_vapor_pressure_deficit", "vapor_pressure_deficit", "vpd"]},
+
+    # Fire / forest weather (GridMET / NFDRS)
+    "eto":    {"dataset_id": "eto",    "vars": ["reference_evapotranspiration", "daily_reference_evapotranspiration", "potential_evapotranspiration", "eto"]},
+    "vs":     {"dataset_id": "vs",     "vars": ["wind_speed", "mean_wind_speed", "daily_mean_wind_speed", "vs"]},
+    "erc":    {"dataset_id": "erc",    "vars": ["energy_release_component", "erc"]},
+    "bi":     {"dataset_id": "bi",     "vars": ["burning_index", "bi"]},
+    "fm100":  {"dataset_id": "fm100",  "vars": ["fuel_moisture_100hr", "dead_fuel_moisture_100hr", "fm100"]},
+    "fm1000": {"dataset_id": "fm1000", "vars": ["fuel_moisture_1000hr", "dead_fuel_moisture_1000hr", "fm1000"]},
+    "rmin":   {"dataset_id": "rmin",   "vars": ["daily_minimum_relative_humidity", "minimum_relative_humidity", "rmin"]},
+    "rmax":   {"dataset_id": "rmax",   "vars": ["daily_maximum_relative_humidity", "maximum_relative_humidity", "rmax"]},
+    "srad":   {"dataset_id": "srad",   "vars": ["surface_downwelling_shortwave_flux_in_air", "shortwave_radiation", "daily_mean_shortwave_radiation", "srad"]},
 }
 
 def gridmet_ncss_url(dataset_id: str) -> str:
@@ -1049,35 +1070,188 @@ def run_download_pipeline(
 
     # Cleaned climate csv
     out_clim_clean = os.path.join(job_dir, "climate_point_clean.csv")
-    df_pr  = clim_point.get("pr")
-    df_tx  = clim_point.get("tmmx")
-    df_tn  = clim_point.get("tmmn")
-    df_vpd = clim_point.get("vpd")
 
+    # Pull the point time axis from the first available dataset
+    def _time_axis(df: Optional[pd.DataFrame]) -> Optional[pd.Series]:
+        if df is None or "time" not in df.columns:
+            return None
+        return pd.to_datetime(df["time"], utc=True).dt.tz_convert(None)
+
+    # Convenience: pick a numeric value column from a NCSS CSV
     def _pick_numeric(df: Optional[pd.DataFrame]) -> Optional[str]:
         if df is None:
             return None
         num = df.select_dtypes(include=[np.number]).columns.tolist()
         return num[-1] if num else None
 
-    t = pd.to_datetime(df_pr["time"]) if df_pr is not None and "time" in df_pr.columns else None
+    df_pr  = clim_point.get("pr")
+    df_tx  = clim_point.get("tmmx")
+    df_tn  = clim_point.get("tmmn")
+    df_vpd = clim_point.get("vpd")
+    df_eto = clim_point.get("eto")
+    df_vs  = clim_point.get("vs")
+    df_erc = clim_point.get("erc")
+    df_bi  = clim_point.get("bi")
+    df_fm100  = clim_point.get("fm100")
+    df_fm1000 = clim_point.get("fm1000")
+    df_rmin = clim_point.get("rmin")
+    df_rmax = clim_point.get("rmax")
+    df_srad = clim_point.get("srad")
 
+    t = _time_axis(df_pr) or _time_axis(df_tx) or _time_axis(df_tn) or _time_axis(df_vpd)
+    if t is None:
+        raise RuntimeError("Could not build climate time axis (no 'time' column in GridMET point outputs)")
+
+    # Find likely data columns
     pr_col  = next((c for c in (df_pr.columns if df_pr is not None else []) if "precip" in c.lower()), _pick_numeric(df_pr))
     tx_col  = next((c for c in (df_tx.columns if df_tx is not None else []) if "temp" in c.lower() or "tmmx" in c.lower()), _pick_numeric(df_tx))
     tn_col  = next((c for c in (df_tn.columns if df_tn is not None else []) if "temp" in c.lower() or "tmmn" in c.lower()), _pick_numeric(df_tn))
-    vpd_col = next((c for c in (df_vpd.columns if df_vpd is not None else []) if "vapor" in c.lower() or "vpd" in c.lower()), _pick_numeric(df_vpd))
+    vpd_col = next((c for c in (df_vpd.columns if df_vpd is not None else []) if "vpd" in c.lower() or "vapor" in c.lower()), _pick_numeric(df_vpd))
+    eto_col = next((c for c in (df_eto.columns if df_eto is not None else []) if "eto" in c.lower() or "evapo" in c.lower()), _pick_numeric(df_eto))
+    vs_col  = next((c for c in (df_vs.columns  if df_vs  is not None else []) if "wind" in c.lower() or "vs" in c.lower()), _pick_numeric(df_vs))
+    erc_col = next((c for c in (df_erc.columns if df_erc is not None else []) if "erc" in c.lower() or "energy" in c.lower()), _pick_numeric(df_erc))
+    bi_col  = next((c for c in (df_bi.columns  if df_bi  is not None else []) if "bi" in c.lower() or "burn" in c.lower()), _pick_numeric(df_bi))
+    fm100_col  = next((c for c in (df_fm100.columns  if df_fm100  is not None else []) if "fm100" in c.lower() or "100" in c.lower()), _pick_numeric(df_fm100))
+    fm1000_col = next((c for c in (df_fm1000.columns if df_fm1000 is not None else []) if "fm1000" in c.lower() or "1000" in c.lower()), _pick_numeric(df_fm1000))
+    rmin_col = next((c for c in (df_rmin.columns if df_rmin is not None else []) if "rmin" in c.lower() or "humid" in c.lower()), _pick_numeric(df_rmin))
+    rmax_col = next((c for c in (df_rmax.columns if df_rmax is not None else []) if "rmax" in c.lower() or "humid" in c.lower()), _pick_numeric(df_rmax))
+    srad_col = next((c for c in (df_srad.columns if df_srad is not None else []) if "srad" in c.lower() or "rad" in c.lower()), _pick_numeric(df_srad))
 
     out = pd.DataFrame({"time": t})
-    if pr_col:
+
+    if pr_col and df_pr is not None:
         out["pr_mm"] = gridmet_decode(df_pr[pr_col], "pr", meta.get("gridmet_pr_var"))
-    if tx_col:
+
+    if tx_col and df_tx is not None:
         out["tmax_C"] = gridmet_decode_temp_C(df_tx[tx_col], "tmmx", meta.get("gridmet_tmmx_var"))
-    if tn_col:
+
+    if tn_col and df_tn is not None:
         out["tmin_C"] = gridmet_decode_temp_C(df_tn[tn_col], "tmmn", meta.get("gridmet_tmmn_var"))
+
     if "tmax_C" in out.columns and "tmin_C" in out.columns:
         out["tmean_C"] = (out["tmax_C"] + out["tmin_C"]) / 2.0
-    if vpd_col:
-        out["vpd"] = df_vpd[vpd_col].astype("float32")
+
+    if vpd_col and df_vpd is not None:
+        out["vpd"] = gridmet_decode(df_vpd[vpd_col], "vpd", meta.get("gridmet_vpd_var"))
+
+    if eto_col and df_eto is not None:
+        out["eto_mm"] = gridmet_decode(df_eto[eto_col], "eto", meta.get("gridmet_eto_var"))
+
+    if vs_col and df_vs is not None:
+        out["wind_ms"] = gridmet_decode(df_vs[vs_col], "vs", meta.get("gridmet_vs_var"))
+
+    if ("vpd" in out.columns) and ("wind_ms" in out.columns):
+        out["hdw"] = out["vpd"] * out["wind_ms"]  # simple hot-dry-windy proxy
+
+    if erc_col and df_erc is not None:
+        out["erc"] = gridmet_decode(df_erc[erc_col], "erc", meta.get("gridmet_erc_var"))
+
+    if bi_col and df_bi is not None:
+        out["bi"] = gridmet_decode(df_bi[bi_col], "bi", meta.get("gridmet_bi_var"))
+
+    if fm100_col and df_fm100 is not None:
+        out["fm100"] = gridmet_decode(df_fm100[fm100_col], "fm100", meta.get("gridmet_fm100_var"))
+
+    if fm1000_col and df_fm1000 is not None:
+        out["fm1000"] = gridmet_decode(df_fm1000[fm1000_col], "fm1000", meta.get("gridmet_fm1000_var"))
+
+    if rmin_col and df_rmin is not None:
+        out["rmin"] = gridmet_decode(df_rmin[rmin_col], "rmin", meta.get("gridmet_rmin_var"))
+
+    if rmax_col and df_rmax is not None:
+        out["rmax"] = gridmet_decode(df_rmax[rmax_col], "rmax", meta.get("gridmet_rmax_var"))
+
+    if srad_col and df_srad is not None:
+        out["srad"] = gridmet_decode(df_srad[srad_col], "srad", meta.get("gridmet_srad_var"))
+
+    # --- KBDI (Keetch-Byram Drought Index) ---
+    # Uses daily precip + daily Tmax and a "normal annual precip" parameter.
+    # We estimate MAP from GridMET pr over a baseline period (default 1991-2020).
+
+    def _estimate_map_mm() -> Optional[float]:
+        try:
+            base_start = os.getenv("FMAP_KBDI_BASE_START", "1991-01-01")
+            base_end   = os.getenv("FMAP_KBDI_BASE_END", "2020-12-31")
+            base_csv = os.path.join(job_dir, "gridmet_pr_point_kbdi_base.csv")
+            _, dfb, usedv = ncss_point_csv("pr", GRIDMET_DATASETS["pr"]["vars"], pt_lon, pt_lat, base_start, base_end, base_csv)
+            dfb["time"] = pd.to_datetime(dfb["time"], utc=True).dt.tz_convert(None)
+            prc = next((c for c in dfb.columns if "precip" in c.lower()), _pick_numeric(dfb))
+            if not prc:
+                return None
+            pr_mm = gridmet_decode(dfb[prc], "pr", usedv)
+            by_year = pr_mm.groupby(dfb["time"].dt.year).sum(min_count=1)
+            by_year = by_year.dropna()
+            if by_year.empty:
+                return None
+            return float(by_year.mean())
+        except Exception:
+            return None
+
+    def _kbdi_series(pr_mm: pd.Series, tmax_C: pd.Series, map_mm: float) -> pd.Series:
+        # Imperial formula implementation.
+        pr_in = pr_mm.astype("float64") / 25.4
+        tF = tmax_C.astype("float64") * 9.0 / 5.0 + 32.0
+        P_in = float(map_mm) / 25.4
+        n = len(pr_in)
+        outv = np.full(n, np.nan, dtype="float64")
+        kbdi = 0.0
+        denom = (1.0 + 10.88 * np.exp(-0.0441 * P_in))
+        for i in range(n):
+            r = pr_in.iat[i]
+            t = tF.iat[i]
+            if not np.isfinite(r) or not np.isfinite(t):
+                outv[i] = np.nan
+                continue
+            if r > 0.2:
+                kbdi = max(0.0, kbdi - 100.0 * (r - 0.2))
+            dq = (800.0 - kbdi) * (0.968 * np.exp(0.0486 * t) - 8.30) / denom * 0.001
+            if not np.isfinite(dq) or dq < 0:
+                dq = 0.0
+            kbdi = min(800.0, kbdi + dq)
+            outv[i] = kbdi
+        return pd.Series(outv, index=pr_mm.index)
+
+    try:
+        if ("pr_mm" in out.columns) and ("tmax_C" in out.columns):
+            map_mm = _estimate_map_mm() or 1000.0
+            meta["kbdi_map_mm"] = float(map_mm)
+
+            # Optional spin-up from spi_start so KBDI is not forced to start at 0 on date_start
+            spinup = os.getenv("FMAP_KBDI_SPINUP", "1").strip().lower() in ("1", "true", "yes")
+            if spinup:
+                try:
+                    kbdi_csv_pr = os.path.join(job_dir, "gridmet_pr_point_kbdi_spinup.csv")
+                    _, dfpr2, usedp = ncss_point_csv("pr", GRIDMET_DATASETS["pr"]["vars"], pt_lon, pt_lat, spi_start, date_end, kbdi_csv_pr)
+                    kbdi_csv_tx = os.path.join(job_dir, "gridmet_tmmx_point_kbdi_spinup.csv")
+                    _, dftx2, usedt = ncss_point_csv("tmmx", GRIDMET_DATASETS["tmmx"]["vars"], pt_lon, pt_lat, spi_start, date_end, kbdi_csv_tx)
+
+                    dfpr2["time"] = pd.to_datetime(dfpr2["time"], utc=True).dt.tz_convert(None)
+                    dftx2["time"] = pd.to_datetime(dftx2["time"], utc=True).dt.tz_convert(None)
+
+                    prc2 = next((c for c in dfpr2.columns if "precip" in c.lower()), _pick_numeric(dfpr2))
+                    txc2 = next((c for c in dftx2.columns if "temp" in c.lower() or "tmmx" in c.lower()), _pick_numeric(dftx2))
+                    if prc2 and txc2:
+                        pr2 = gridmet_decode(dfpr2[prc2], "pr", usedp)
+                        tx2 = gridmet_decode_temp_C(dftx2[txc2], "tmmx", usedt)
+                        dfk = pd.DataFrame({"time": dfpr2["time"], "pr_mm": pr2}).merge(
+                            pd.DataFrame({"time": dftx2["time"], "tmax_C": tx2}), on="time", how="inner"
+                        ).sort_values("time")
+                        kb_full = _kbdi_series(dfk["pr_mm"], dfk["tmax_C"], map_mm)
+                        kb_full.index = dfk["time"].values
+                        # Slice to job window
+                        t0 = pd.to_datetime(date_start)
+                        t1 = pd.to_datetime(date_end)
+                        kb_win = kb_full.loc[(kb_full.index >= t0) & (kb_full.index <= t1)]
+                        # Align to out time axis
+                        out = out.merge(pd.DataFrame({"time": kb_win.index, "kbdi": kb_win.values}), on="time", how="left")
+                    else:
+                        out["kbdi"] = _kbdi_series(out["pr_mm"], out["tmax_C"], map_mm).values
+                except Exception:
+                    out["kbdi"] = _kbdi_series(out["pr_mm"], out["tmax_C"], map_mm).values
+            else:
+                out["kbdi"] = _kbdi_series(out["pr_mm"], out["tmax_C"], map_mm).values
+    except Exception as e:
+        meta.setdefault("warnings", []).append(f"KBDI computation failed: {e}")
 
     out.to_csv(out_clim_clean, index=False)
 
