@@ -24,6 +24,8 @@ from pydantic import BaseModel, Field, model_validator
 import logging
 import threading
 import io
+import json
+from pathlib import Path
 import faulthandler
 
 from fmap_download import run_download_pipeline, ncss_point_csv, GRIDMET_DATASETS, spi_gamma_monthly
@@ -183,6 +185,210 @@ def _largest_files(job_dir: str, top_n: int = 8) -> List[Dict[str, Any]]:
         return []
 
 
+
+# ----------------------------
+# Description.txt generation (run metadata + chart/field dictionary)
+# ----------------------------
+DESCRIPTION_FILENAME = "description.txt"
+ANALYSIS_JSON_FILENAME = "analysis_result.json"
+DESCRIPTION_TEMPLATE_FILENAME = "FMAP_Analysis_Catalog.txt"
+
+# Built-in fallback template (used only if DESCRIPTION_TEMPLATE_FILENAME is not found in the repo).
+_DESCRIPTION_TEMPLATE_FALLBACK = "FMAP-AI \u2014 Analysis & Output Catalog (Prototype)\nGenerated: 2026-02-25 18:41:24\n\nPurpose\nThis file documents the analyses, derived indices, chart panels, and ZIP output items produced by\nthe FMAP-AI prototype. It is intended to help reviewers (e.g., a professor evaluating a funding\nopportunity) understand what each chart represents, where the data come from, and which outputs are\ndownloaded vs computed.\n\n========================================================================================\n1) Run Inputs (from analysis_result.json \u2192 request)\n- pt_lon: -93.65\n- pt_lat: 42.03\n- minlon: -93.67418734481853\n- minlat: 42.01203377650018\n- maxlon: -93.62581265518148\n- maxlat: 42.04796622349982\n- date_start: 2026-01-11\n- date_end: 2026-02-20\n- spi_start: 2021-01-01\n- cloud_cover_lt: 60.0\n- keep_rasters: False\n- include_zip: True\n- size_px: 512\n- selection: point\n- region_n_samples: 9\n- region_sample_strategy: grid\n\n========================================================================================\n2) Data Sources (Downloaded Inputs)\n  - GridMET daily weather (via THREDDS/NCSS point subsetting): precipitation, temperature, vapor pressure deficit, and optional fire-weather variables.\n  - Landsat 8/9 Collection 2 Level-2 scenes (via STAC / Planetary Computer): used to compute NDVI/NDMI/NBR over the bbox and at the point.\n  - NLCD Land Cover + NLCD Tree Canopy (USGS MRLC services): used to determine forest mask and canopy percent.\n  - WFIGS fire perimeters (vector): used to detect recent fires and compute burned area intersecting the bbox.\n  - MTBS burn severity (raster mosaic): used to summarize burn severity over bbox when available.\n  - Forest biomass/carbon rasters (e.g., FIA-based aboveground biomass, aboveground carbon): used for point values and forest-only distributions.\n  - Optional: LCMS disturbance / tree cover loss (if enabled in backend).\n\n========================================================================================\n3) Derived / Computed Indices (Computed from downloaded inputs)\n  - Vegetation indices (from Landsat reflectance):\n  -   \u2022 NDVI = (NIR - Red) / (NIR + Red) \u2014 vegetation greenness.\n  -   \u2022 NDMI = (NIR - SWIR1) / (NIR + SWIR1) \u2014 vegetation moisture proxy.\n  -   \u2022 NBR  = (NIR - SWIR2) / (NIR + SWIR2) \u2014 burn / disturbance proxy.\n  - Climate summaries (from GridMET point series): totals and means over the selected date range.\n  - SPI-30 (optional / supporting drought context): computed from precipitation series using robust fitting + fallbacks.\n  - Fire/forest weather indices (GridMET-only, if enabled in your build):\n  -   \u2022 KBDI (Keetch\u2013Byram Drought Index): duff/fuel dryness proxy (0\u2013800 scale).\n  -   \u2022 HDW proxy = VPD \u00d7 Wind: hot-dry-windy severity indicator.\n  -   \u2022 ERC / BI / Fuel Moisture metrics (FM100, FM1000): operational fire-danger variables when present in GridMET download.\n\n========================================================================================\n4) Analyses / Metrics (Analysis summaries used by charts)\nThese metrics are typically stored in analysis_result.json. Availability depends on data coverage and whether the\nselected point is classified as forest by NLCD (forest-only metrics are computed over nearby forest pixels in the bbox).\n\n4.1 Landcover / Forest context\n  - NLCD class at point: 24 \u2014 Developed, High Intensity\n  - Is forest at point: False\n  - Forest fraction inside bbox: 0.108154296875\n  - Canopy % at point (NLCD tree canopy): canopy_pct_point\n  - Forest mask point: forest_mask_point (1=forest, 0=non-forest)\n  - Note: forest-only distributions use the forest mask within the bbox.\n\n4.2 Vegetation (Landsat)\n  - Selected Landsat scene: LC09_L2SP_027031_20260131_02_T1 (cloud_cover=0.7)\n  - Point + bbox-mean for NDVI, NDMI, NBR\n  - NDVI distribution stats over bbox (min/max/mean/p10/p50/p90/count) if computed\n  - NDVI distribution stats over forest-only pixels if forest exists in bbox\n\n4.3 Climate (GridMET point series)\n  - Precipitation total (mm) and mean (mm/day)\n  - Tmax/Tmin/Tmean means (\u00b0C) over selected date range\n  - VPD mean over selected date range (units as provided by GridMET variable; verify scaling in your backend if needed)\n  - n_days: number of daily records\n\n4.4 Drought (supporting)\n  - SPI-30 summary stats (mean/min/max/last/n).\n  - Note: SPI is included as drought context; fire/forest risk is better captured by VPD, ETo, fuel moisture, KBDI, ERC/BI.\n\n4.5 Disturbance / Fire\n  - WFIGS perimeters in bbox: wfigs_features_in_bbox\n  - Burned area summary (km\u00b2) derived from perimeters intersecting bbox\n  - MTBS burn severity raster layer name (if an MTBS raster matched) + severity statistics/histograms when enabled\n\n4.6 Biomass & Carbon\n  - AGB point value (lb/ac and Mg/ha) + forest-only distribution stats within bbox when available\n  - AGC (aboveground carbon) point value (lb/ac and Mg/ha) + forest-only distribution stats within bbox when available\n  - Note: if point is not forest, point AGB/AGC may be less meaningful; distributions over nearby forest pixels are preferred.\n\n4.7 Carbon loss proxy (experimental)\n  - A simple proxy layer (often based on disturbance mask \u00d7 carbon) summarized with percentiles.\n  - If disturbance/loss is absent, values may be zero.\n\n========================================================================================\n5) Chart Panels (What each chart represents + required data)\n\n5.1 Climate / Weather\n  - Daily precipitation (bar/line): from GridMET precipitation point series.\n  - Daily Tmax/Tmin/Tmean (line): from GridMET temperature point series.\n  - Daily VPD / ETo / Wind (line): from GridMET point series (if downloaded).\n  - SPI-30 (line): computed from precipitation series (optional).\n\n5.2 Vegetation (Landsat)\n  - NDVI/NDMI/NBR point and bbox mean (numbers + small chart): derived from Landsat scene over bbox.\n  - NDVI distribution over bbox (histogram/box/percentiles): requires NDVI stats or histogram computed over bbox.\n  - NDVI distribution over forest-only pixels: requires NLCD forest mask + NDVI raster stats.\n\n5.3 Forest Structure & Biomass\n  - Canopy cover (if available): from NLCD canopy WCS (point + bbox stats).\n  - Canopy height (future): requires a canopy height data source (e.g., GEDI-derived canopy height) \u2014 not in baseline.\n  - AGB & AGC distributions: from biomass/carbon rasters, summarized over forest pixels in bbox.\n\n5.4 Disturbance / Tree loss / Burn\n  - Fire perimeters & burned area: from WFIGS perimeters intersecting bbox.\n  - Burn severity: from MTBS burn severity raster (only if fire occurred and MTBS data available).\n  - Tree cover loss / disturbance (if enabled): from LCMS or similar disturbance product; used to compute loss metrics and carbon-loss proxy.\n\n5.5 Fire / Forest Weather (GridMET-only, recommended for forestry)\n  - KBDI (0\u2013800): computed from daily Tmax + precip + normal annual precip baseline.\n  - HDW proxy (VPD \u00d7 Wind): computed from GridMET VPD and wind speed.\n  - ERC and BI: downloaded GridMET operational fire-danger indices (if available).\n  - Fuel moisture (FM100/FM1000): downloaded from GridMET (if available).\n\n========================================================================================\n6) ZIP Output Items (Download bundle)\nThe ZIP is intended for reproducibility and offline review. Exact files depend on keep_rasters/include_zip flags\nand data availability. Typical items:\n\n6.1 Always included (recommended)\n  - analysis_result.json \u2014 single JSON summary used by the frontend to populate cards/charts.\n  - climate_point_clean.csv \u2014 daily point time series (precip/temp/VPD and any extra variables).\n  - spi30_point.csv \u2014 SPI-30 time series (if SPI enabled in backend).\n  - job.log / state.json \u2014 debug metadata (optional but helpful).\n\n6.2 Included when fire products are available\n  - wfigs_perimeters_bbox.geojson \u2014 fire perimeters intersecting bbox (if any).\n  - burned_area_from_perimeters.csv \u2014 table of burned area by perimeter and totals.\n\n6.3 Included when rasters are enabled or needed for review (keep_rasters=true)\n  - ndvi_bbox.tif / ndmi_bbox.tif / nbr_bbox.tif \u2014 vegetation index rasters over bbox (optional).\n  - nlcd_landcover_bbox.tif / nlcd_canopy_bbox.tif \u2014 landcover/canopy rasters (optional).\n  - mtbs_burn_severity_bbox.tif \u2014 burn severity raster over bbox (optional).\n  - fia_agb_raw_bbox.tif \u2014 aboveground biomass raster over bbox (optional).\n  - agc_*_bbox.tif \u2014 aboveground carbon raster over bbox (optional).\n  - lcms_tree_loss_bbox.tif \u2014 tree cover loss/disturbance raster (optional, if enabled).\n\n========================================================================================\n7) Notes on Missing/Empty Charts (Expected behavior)\n  - Some panels legitimately show 'not available' when a data source is temporarily offline (e.g., NLCD WCS 503).\n  - Some panels are empty when the point/bbox is not forest (NLCD class not 41/42/43) or when there is no fire in the bbox.\n  - Very recent date ranges may yield no Landsat scenes under a strict cloud filter; widening the date range/bbox improves success.\n  - On free Render instances, keep_rasters=true or large bbox/time ranges can exceed /tmp storage; prefer keep_rasters=false for demos.\n\n========================================================================================\n8) JSON Schema Summary (analysis_result.json keys)\nTop-level keys present in current example:\n  - generated_at, request, download_meta, point, bbox, landcover, vegetation, climate, spi30, disturbance, biomass_carbon, carbon_loss_proxy\n\nKey highlights from current example (for reference):\n  - landcover.nlcd_label_point = Developed, High Intensity\n  - vegetation.ndvi_stats_bbox.count = 17688\n  - climate.n_days = 41\n  - disturbance.wfigs_features_in_bbox = 0\n  - biomass_carbon.agb.layer_name = dry_biomass_aboveground_01\n"
+
+def _load_description_template_text() -> str:
+    """Load a human-readable template for what the tool produces.
+
+    If you commit FMAP_Analysis_Catalog.txt to your backend repo root, it will be used.
+    Otherwise, a built-in fallback template is used.
+    """
+    try:
+        here = Path(__file__).resolve().parent
+        p = here / DESCRIPTION_TEMPLATE_FILENAME
+        if p.exists():
+            return p.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+    return _DESCRIPTION_TEMPLATE_FALLBACK
+
+
+def _flatten_json_paths(obj: Any, prefix: str = "") -> List[Tuple[str, Any]]:
+    """Return (path, value) pairs for dict/list trees."""
+    out: List[Tuple[str, Any]] = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            p = f"{prefix}.{k}" if prefix else str(k)
+            out.extend(_flatten_json_paths(v, p))
+        return out
+    if isinstance(obj, list):
+        # Don't explode huge arrays; keep only summary.
+        out.append((prefix, obj))
+        return out
+    out.append((prefix, obj))
+    return out
+
+
+def _summarize_value(v: Any) -> str:
+    if v is None:
+        return "null"
+    if isinstance(v, (str, int, float, bool)):
+        s = str(v)
+        return s if len(s) <= 120 else s[:117] + "..."
+    if isinstance(v, dict):
+        return f"object(keys={len(v)})"
+    if isinstance(v, list):
+        return f"list(len={len(v)})"
+    return str(type(v).__name__)
+
+
+def _path_kind(path: str) -> str:
+    """Classify fields into input/downloaded/analysis/meta."""
+    if path == "generated_at":
+        return "meta"
+    if path.startswith("request."):
+        return "input"
+    if path.startswith("download_meta."):
+        return "downloaded"
+    if path.startswith("point.") or path.startswith("bbox."):
+        return "input"
+    return "analysis"
+
+
+def _path_chart_group(path: str) -> str:
+    if path.startswith("climate."):
+        return "Climate"
+    if path.startswith("spi30."):
+        return "Drought"
+    if path.startswith("vegetation."):
+        return "Vegetation"
+    if path.startswith("landcover.") or path.startswith("canopy."):
+        return "Landcover/Canopy"
+    if path.startswith("disturbance.") or path.startswith("burn_severity."):
+        return "Fire/Burn"
+    if path.startswith("tree_cover_loss."):
+        return "Tree loss"
+    if path.startswith("biomass_carbon."):
+        return "Biomass/Carbon"
+    if path.startswith("carbon_loss_proxy."):
+        return "Carbon loss"
+    return "Other"
+
+
+# Known field descriptions + units (fallback when available)
+_FIELD_INFO: Dict[str, Dict[str, str]] = {
+    "climate.pr_total_mm": {"units": "mm", "desc": "Total precipitation over date_start–date_end (GridMET point)."},
+    "climate.pr_mean_mm_per_day": {"units": "mm/day", "desc": "Mean daily precipitation over date_start–date_end (GridMET point)."},
+    "climate.tmax_mean_C": {"units": "°C", "desc": "Mean daily maximum air temperature over date_start–date_end (GridMET point)."},
+    "climate.tmin_mean_C": {"units": "°C", "desc": "Mean daily minimum air temperature over date_start–date_end (GridMET point)."},
+    "climate.tmean_mean_C": {"units": "°C", "desc": "Mean daily average air temperature over date_start–date_end (GridMET point)."},
+    "climate.vpd_mean": {"units": "kPa (check scaling)", "desc": "Mean vapor pressure deficit over date_start–date_end (GridMET point)."},
+    "spi30.mean": {"units": "SPI", "desc": "Mean SPI-30 over date_start–date_end (computed from precip series)."},
+    "vegetation.ndvi.point": {"units": "-", "desc": "NDVI at selected point from chosen Landsat scene."},
+    "vegetation.ndvi.bbox_mean": {"units": "-", "desc": "Mean NDVI over bbox from chosen Landsat scene."},
+    "vegetation.ndmi.point": {"units": "-", "desc": "NDMI at selected point from chosen Landsat scene."},
+    "vegetation.nbr.point": {"units": "-", "desc": "NBR at selected point from chosen Landsat scene."},
+    "landcover.nlcd_label_point": {"units": "", "desc": "NLCD landcover class label at the selected point."},
+    "canopy.canopy_cover_pct_point": {"units": "%", "desc": "NLCD tree canopy cover percent at the selected point (if available)."},
+    "burn_severity.hist_bbox": {"units": "", "desc": "Categorical histogram of burn severity class values in bbox (MTBS)."},
+    "tree_cover_loss.layer_name": {"units": "", "desc": "Tree cover loss layer used (e.g., LCMS fast-loss product)."},
+    "biomass_carbon.agb.layer_name": {"units": "", "desc": "Aboveground biomass raster layer name used for AGB metrics."},
+    "biomass_carbon.agc.layer_name": {"units": "", "desc": "Aboveground carbon raster layer name used for AGC metrics."},
+}
+
+
+def _field_units(path: str) -> str:
+    info = _FIELD_INFO.get(path)
+    return info.get("units", "") if info else ""
+
+
+def _field_desc(path: str) -> str:
+    info = _FIELD_INFO.get(path)
+    if info and info.get("desc"):
+        return info["desc"]
+    g = _path_chart_group(path)
+    if path.startswith("download_meta."):
+        return "Download/pipeline metadata captured during the run."
+    if g == "Other":
+        return "Derived metric or metadata (see analysis_result.json)."
+    return f"{g} metric used by charts and summary panels."
+
+
+def _write_description_txt(job_id: str, job_dir: str) -> str:
+    """Create a per-job description.txt (template + dynamic dictionary + output file list)."""
+    job_dir_p = Path(job_dir)
+    analysis_path = job_dir_p / ANALYSIS_JSON_FILENAME
+
+    # Load analysis_result.json (if missing, write a minimal stub).
+    if not analysis_path.exists():
+        try:
+            analysis_path.write_text(_json_dumps({"generated_at": _utc_now()}), encoding="utf-8")
+        except Exception:
+            pass
+
+    try:
+        analysis_obj = json.loads(analysis_path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        analysis_obj = {}
+
+    template = _load_description_template_text()
+
+    pairs = _flatten_json_paths(analysis_obj)
+    pairs.sort(key=lambda kv: kv[0])
+
+    lines: List[str] = []
+    lines.append(f"FMAP-AI — Run Description (job_id={job_id})")
+    lines.append(f"Generated: {_utc_now()}")
+    lines.append("")
+    lines.append(f"API links:")
+    lines.append(f"  - analysis_result.json: /fmap/analysis_result/{job_id}")
+    lines.append(f"  - description.txt:     /fmap/description/{job_id}")
+    lines.append(f"  - zip (if enabled):    /fmap/download/{job_id}")
+    lines.append("")
+    lines.append("=" * 88)
+    lines.append("A) Overview Template")
+    lines.append(template.strip())
+    lines.append("")
+    lines.append("=" * 88)
+    lines.append("B) Run-specific field dictionary (from analysis_result.json)")
+    lines.append("Legend: kind = input | downloaded | analysis | meta")
+    lines.append("")
+
+    for path, value in pairs:
+        kind = _path_kind(path)
+        group = _path_chart_group(path)
+        units = _field_units(path)
+        desc = _field_desc(path)
+        val = _summarize_value(value)
+        lines.append(f"- {path}")
+        lines.append(f"    kind: {kind} | group: {group}" + (f" | units: {units}" if units else ""))
+        lines.append(f"    value: {val}")
+        lines.append(f"    desc: {desc}")
+
+    lines.append("")
+    lines.append("=" * 88)
+    lines.append("C) Output files present in job directory (these are what the ZIP contains)")
+    try:
+        rows = []
+        for fp in job_dir_p.rglob("*"):
+            if fp.is_file():
+                rel = fp.relative_to(job_dir_p).as_posix()
+                try:
+                    sz = fp.stat().st_size
+                except Exception:
+                    sz = 0
+                rows.append((rel, sz))
+        rows.sort(key=lambda r: r[0])
+        for rel, sz in rows:
+            lines.append(f"- {rel} ({sz/1024:.1f} KB)")
+    except Exception as e:
+        lines.append(f"(Unable to list output files: {e})")
+
+    out_path = job_dir_p / DESCRIPTION_FILENAME
+    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return str(out_path)
+
+
+
 def _clean_success_outputs(job_dir: str) -> None:
     """Remove heavy outputs after success (keeps job.log)."""
     keep = {"job.log"}
@@ -223,110 +429,6 @@ def _dir_size_bytes(path: str) -> int:
     except Exception:
         return total
     return total
-
-
-
-# -----------------------------------------------------------------------------
-# Description file (human-readable catalog) per job
-# -----------------------------------------------------------------------------
-DESCRIPTION_FILENAME = os.getenv("FMAP_DESCRIPTION_FILENAME", "description.txt")
-
-
-def _job_description_path(job_dir: str) -> str:
-    return os.path.join(job_dir, DESCRIPTION_FILENAME)
-
-
-def _classify_output_item(relpath: str) -> Dict[str, str]:
-    """Heuristic classification for job output items."""
-    p = relpath.lower()
-    if p.endswith(".json") and "analysis_result" in p:
-        return {"type": "analysis", "desc": "Main analysis summary consumed by the frontend (charts/cards)."}
-    if p.endswith(".csv") and "climate_point" in p:
-        return {"type": "download+clean", "desc": "GridMET point time series (downloaded via NCSS) after cleaning/units fixes."}
-    if p.endswith(".csv") and "spi" in p:
-        return {"type": "computed", "desc": "SPI time series computed from precipitation."}
-    if p.endswith(".geojson"):
-        return {"type": "download", "desc": "Vector output (e.g., fire perimeters) clipped to bbox."}
-    if p.endswith(".tif") or p.endswith(".tiff"):
-        if "ndvi" in p or "ndmi" in p or "nbr" in p:
-            return {"type": "computed", "desc": "Vegetation index raster derived from Landsat over bbox."}
-        if "nlcd" in p or "canopy" in p:
-            return {"type": "download", "desc": "NLCD landcover/canopy raster fetched for bbox (used for forest mask/canopy)."}
-        if "mtbs" in p or "burn" in p or "dnbr" in p or "severity" in p:
-            return {"type": "download", "desc": "Burn severity / fire raster for bbox (when available)."}
-        if "agb" in p or "carbon" in p or "fia" in p:
-            return {"type": "download", "desc": "Biomass/carbon raster for bbox (point + forest distributions)."}
-        return {"type": "download", "desc": "Raster output for bbox (source-dependent)."}
-    if p.endswith(".log") or "state.json" in p:
-        return {"type": "debug", "desc": "Debug metadata/logs for troubleshooting."}
-    if p.endswith(".zip"):
-        return {"type": "bundle", "desc": "ZIP bundle of job outputs."}
-    if p.endswith(".txt") and "description" in p:
-        return {"type": "documentation", "desc": "Human-readable description of outputs and chart meanings."}
-    return {"type": "output", "desc": "Job output file."}
-
-
-def _write_description_txt(job_id: str, job_dir: str, request_dict: Dict[str, Any]) -> str:
-    """Create/update a per-job description.txt inside the job directory."""
-    # Collect current files in job_dir (relative paths)
-    rel_files: List[str] = []
-    for root, _dirs, files in os.walk(job_dir):
-        for fn in files:
-            fp = os.path.join(root, fn)
-            rel = os.path.relpath(fp, job_dir)
-            # Skip the job zip if present (can be huge and redundant)
-            if rel.lower().endswith(".zip") and rel.startswith(job_id):
-                continue
-            rel_files.append(rel)
-    rel_files = sorted(rel_files)
-
-    # Build documentation
-    lines: List[str] = []
-    lines.append("FMAP-AI — Outputs & Chart Guide")
-    lines.append(f"Job ID: {job_id}")
-    lines.append(f"Generated (UTC): {_utc_now()}")
-    lines.append("")
-    lines.append("A) What this run does")
-    lines.append("  - Downloads point/bbox subsets from public datasets (GridMET + optional remote-sensing layers).")
-    lines.append("  - Computes derived indices (SPI, vegetation indices, fire-weather indices when enabled).")
-    lines.append("  - Summarizes forest/disturbance context (landcover, canopy, biomass/carbon, fire products when available).")
-    lines.append("  - Packages results for the web dashboard and optional ZIP download.")
-    lines.append("")
-    lines.append("B) Run inputs")
-    for k in [
-        "pt_lon","pt_lat","minlon","minlat","maxlon","maxlat",
-        "date_start","date_end","spi_start","cloud_cover_lt",
-        "keep_rasters","include_zip","size_px","selection"
-    ]:
-        if k in request_dict:
-            lines.append(f"  - {k}: {request_dict[k]}")
-    lines.append("")
-    lines.append("C) Charts in the dashboard (how to interpret)")
-    lines.append("  - Climate/Weather: precipitation + temperature series; optional SPI for drought context.")
-    lines.append("  - Vegetation (Landsat): NDVI/NDMI/NBR indicate greenness, moisture stress, and burn/disturbance signal.")
-    lines.append("  - Landcover/Canopy: forest mask and canopy % (if NLCD services are available).")
-    lines.append("  - Burn/Fire: fire perimeters/burned area; burn severity if MTBS coverage exists.")
-    lines.append("  - Biomass/Carbon: AGB/AGC point + forest-only distributions in the bbox.")
-    lines.append("  - Fire/Forest Weather (GridMET-only, if enabled): KBDI, VPD, ETo, wind, HDW proxy, fuel moisture, ERC/BI.")
-    lines.append("")
-    lines.append("D) ZIP / output items produced by this run")
-    if not rel_files:
-        lines.append("  (No files found in job directory.)")
-    else:
-        for rel in rel_files:
-            meta = _classify_output_item(rel)
-            lines.append(f"  - {rel} | type={meta['type']} | {meta['desc']}")
-    lines.append("")
-    lines.append("E) Notes on missing/empty panels")
-    lines.append("  - Some panels require specific data availability (e.g., NLCD WCS can be temporarily 503).")
-    lines.append("  - Fire/burn panels can be empty if no fires intersect the bbox for the selected period.")
-    lines.append("  - Distribution/histogram panels require bbox raster sampling; point-only runs may only show point/bbox mean.")
-    lines.append("")
-
-    path = _job_description_path(job_dir)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-    return path
 
 
 def _safe_rmtree(path: str) -> None:
@@ -504,6 +606,7 @@ class ResultResponse(BaseModel):
     analysis: Dict[str, Any]
     manifest: Dict[str, Any]
     download_url: Optional[str] = None
+    analysis_result_url: Optional[str] = None
     description_url: Optional[str] = None
 
 
@@ -609,12 +712,13 @@ def _run_job(job_id: str, req: RunRequest) -> None:
                 "Try keep_rasters=false, reduce bbox/size_px, or upgrade to a persistent-disk instance."
             )
 
-# Write a human-readable description file for this job (used by the frontend as a link).
-try:
-    desc_path = _write_description_txt(job_id, job_dir, req.model_dump())
-    JOBS[job_id]["description_path"] = desc_path
-except Exception as e:
-    _job_event(job_id, "description:warn", f"Failed to write description.txt: {e}")
+        # Write per-job description.txt (template + dynamic dictionary of analysis_result.json keys)
+        try:
+            desc_path = _write_description_txt(job_id, job_dir)
+            JOBS[job_id]["description_path"] = desc_path
+        except Exception as e:
+            _job_event(job_id, "description:warn", f"Failed to write description.txt: {e}")
+
         manifest = build_manifest(job_dir)
 
         # Optionally build zip for user download (zipping duplicates bytes temporarily).
@@ -726,7 +830,8 @@ def run(req: RunRequest, background: BackgroundTasks):
         started_at=JOBS[job_id]["started_at"],
         result_url=f"/fmap/result/{job_id}",
         download_url=download_url,
-        description_url=description_url,
+        analysis_result_url=f"/fmap/analysis_result/{job_id}",
+        description_url=f"/fmap/description/{job_id}",
     )
 
 
@@ -750,11 +855,8 @@ def run_sync(req: RunRequest):
 
     if meta["status"] == "error":
         raise HTTPException(status_code=500, detail={"error": meta.get("error"), "traceback": meta.get("traceback")})
+
     download_url = f"/fmap/download/{job_id}" if meta.get("zip_path") else None
-    # Description file is always generated for successful jobs (if present).
-    job_dir = meta.get("job_dir")
-    desc_path = _job_description_path(job_dir) if job_dir else None
-    description_url = f"/fmap/description/{job_id}" if (desc_path and os.path.exists(desc_path)) else None
     return ResultResponse(
         job_id=job_id,
         status=meta["status"],
@@ -763,6 +865,8 @@ def run_sync(req: RunRequest):
         analysis=meta["analysis"],
         manifest=meta["manifest"],
         download_url=download_url,
+        analysis_result_url=f"/fmap/analysis_result/{job_id}",
+        description_url=f"/fmap/description/{job_id}",
     )
 
 
@@ -811,6 +915,8 @@ def result(job_id: str):
         analysis=meta["analysis"],
         manifest=meta["manifest"],
         download_url=download_url,
+        analysis_result_url=f"/fmap/analysis_result/{job_id}",
+        description_url=f"/fmap/description/{job_id}",
     )
 
 
@@ -827,25 +933,34 @@ def download(job_id: str):
     return FileResponse(zip_path, media_type="application/zip", filename=os.path.basename(zip_path))
 
 
+@app.get("/fmap/analysis_result/{job_id}")
+def analysis_result(job_id: str):
+    """Return analysis_result.json for a completed job."""
+    meta = JOBS.get(job_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Unknown job_id")
+    job_dir = meta.get("job_dir") or _job_dir(job_id)
+    p = os.path.join(job_dir, ANALYSIS_JSON_FILENAME)
+    if not os.path.exists(p):
+        raise HTTPException(status_code=404, detail="analysis_result.json not found for this job")
+    return FileResponse(p, media_type="application/json", filename=ANALYSIS_JSON_FILENAME)
 
 
 @app.get("/fmap/description/{job_id}")
 def description(job_id: str):
+    """Return description.txt for a completed job."""
     meta = JOBS.get(job_id)
     if not meta:
         raise HTTPException(status_code=404, detail="Unknown job_id")
-
-    if meta.get("status") in ("queued", "running"):
-        raise HTTPException(status_code=409, detail={"status": meta.get("status"), "message": "Not finished yet. Use /fmap/status."})
-
-    if meta.get("status") == "error":
-        raise HTTPException(status_code=500, detail={"error": meta.get("error"), "traceback": meta.get("traceback")})
-
     job_dir = meta.get("job_dir") or _job_dir(job_id)
-    path = _job_description_path(job_dir)
-    if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="description.txt not available for this job.")
-    return FileResponse(path, media_type="text/plain; charset=utf-8", filename=DESCRIPTION_FILENAME)
+    p = os.path.join(job_dir, DESCRIPTION_FILENAME)
+    if not os.path.exists(p):
+        raise HTTPException(status_code=404, detail="description.txt not found for this job")
+    return FileResponse(p, media_type="text/plain; charset=utf-8", filename=DESCRIPTION_FILENAME)
+
+
+
+
 
 @app.get("/fmap/debug/{job_id}")
 def debug_job(job_id: str, req: Request, tail: int = 200) -> Dict[str, Any]:
