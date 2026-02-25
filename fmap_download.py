@@ -65,12 +65,46 @@ _geod = Geod(ellps="WGS84")
 def _ncss_time(t: str) -> str:
     return t if "T" in t else f"{t}T00:00:00Z"
 
-def safe_get(url: str, params=None, timeout: int = 180) -> requests.Response:
+def safe_get(url: str, params=None, timeout: int = 180, retries: int = 5, backoff: float = 1.5) -> requests.Response:
+    """
+    GET with small retry/backoff for transient upstream failures (e.g., 503 from USGS WCS).
+    This prevents the whole job from failing due to temporary outages.
+    """
     headers = {"User-Agent": "FMAP-AI/0.1 (Render API)"}
-    r = requests.get(url, params=params, headers=headers, timeout=timeout)
-    if r.status_code != 200:
-        raise RuntimeError(f"HTTP {r.status_code} for {r.url}: {(r.text or '')[:200]}")
-    return r
+    last_err = None
+    for attempt in range(1, int(retries) + 1):
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=timeout)
+            if r.status_code == 200:
+                return r
+            # Retry on common transient codes
+            if r.status_code in (429, 500, 502, 503, 504):
+                last_err = RuntimeError(f"HTTP {r.status_code} for {r.url}: {(r.text or '')[:200]}")
+                # Respect Retry-After if present
+                ra = r.headers.get("Retry-After")
+                if ra:
+                    try:
+                        import time
+                        time.sleep(float(ra))
+                        continue
+                    except Exception:
+                        pass
+                if attempt < retries:
+                    import time
+                    time.sleep(backoff ** (attempt - 1))
+                    continue
+            raise RuntimeError(f"HTTP {r.status_code} for {r.url}: {(r.text or '')[:200]}")
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                import time
+                time.sleep(backoff ** (attempt - 1))
+                continue
+            raise
+    # Fallback (should not reach)
+    if last_err:
+        raise last_err
+    raise RuntimeError("HTTP request failed")
 
 def pick_asset_key(item, candidates: List[str]) -> str:
     keys = set(item.assets.keys())
@@ -764,26 +798,36 @@ def run_download_pipeline(
     # -------------------------
     # 2) NLCD canopy + landcover (forest mask + proxy group)
     # -------------------------
-    canopy_covs = wcs_list_coverages(WCS_CANOPY, version="1.0.0")
-    canopy_cov  = pick_latest_year_coverage(canopy_covs, prefer_keywords=["canopy", "tree"])
-    if not canopy_cov:
-        raise RuntimeError("Could not find NLCD canopy coverage in WCS capabilities.")
     canopy_tif  = os.path.join(job_dir, "nlcd_canopy_bbox.tif")
-    wcs_getcoverage_geotiff(WCS_CANOPY, canopy_cov, bbox_lonlat, canopy_tif, width=size_px, height=size_px)
-
     land_tif = os.path.join(job_dir, "nlcd_landcover_bbox.tif")
     forest_mask_tif = os.path.join(job_dir, "forest_mask_bbox.tif")
     forest_type_group_tif = os.path.join(job_dir, "forest_type_group_nlcd_bbox.tif")
     canopy_class_tif = os.path.join(job_dir, "canopy_class_bbox.tif")
 
     forest_type_group_exists = False
+    canopy_ok = False
+    land_ok = False
 
+    # NLCD canopy (tree canopy %) is OPTIONAL for the overall job. USGS WCS can be intermittently unavailable (HTTP 503).
+    try:
+        canopy_covs = wcs_list_coverages(WCS_CANOPY, version="1.0.0")
+        canopy_cov  = pick_latest_year_coverage(canopy_covs, prefer_keywords=["canopy", "tree"])
+        if not canopy_cov:
+            raise RuntimeError("Could not find NLCD canopy coverage in WCS capabilities.")
+        wcs_getcoverage_geotiff(WCS_CANOPY, canopy_cov, bbox_lonlat, canopy_tif, width=size_px, height=size_px)
+        canopy_ok = True
+    except Exception as e:
+        meta.setdefault("warnings", []).append(f"NLCD canopy unavailable (WCS): {e}")
+        canopy_ok = False
+
+    # NLCD landcover is OPTIONAL; we use it for forest mask and landcover labels.
     try:
         land_covs = wcs_list_coverages(WCS_LANDCOV, version="1.0.0")
         land_cov  = pick_latest_year_coverage(land_covs, prefer_keywords=["land", "cover"])
         if not land_cov:
             raise RuntimeError("Could not find NLCD landcover coverage in WCS capabilities.")
         wcs_getcoverage_geotiff(WCS_LANDCOV, land_cov, bbox_lonlat, land_tif, width=size_px, height=size_px)
+        land_ok = True
 
         forest_classes = {41, 42, 43}
         with rasterio.open(land_tif) as src:
@@ -797,7 +841,7 @@ def run_download_pipeline(
             with rasterio.open(forest_mask_tif, "w", **profile_m) as dst:
                 dst.write(mask, 1)
 
-            # Forest type group proxy
+            # Forest type group proxy (Deciduous/Evergreen/Mixed)
             ft = np.zeros_like(lc, dtype="uint8")
             ft[lc == 41] = 1
             ft[lc == 42] = 2
@@ -812,48 +856,88 @@ def run_download_pipeline(
 
         meta["forest_fraction_bbox"] = float(mask.mean())
 
-    except Exception:
-        # Fallback forest mask from canopy >=10%
-        with rasterio.open(canopy_tif) as src:
-            c = src.read(1).astype("float32")
-            mask = (c >= 10).astype("uint8")
-            profile_m = src.profile.copy()
-            profile_m.update(dtype="uint8", count=1, nodata=0, compress="deflate", tiled=False)
-            for k in ["blockxsize","blockysize","interleave"]:
-                profile_m.pop(k, None)
-            with rasterio.open(forest_mask_tif, "w", **profile_m) as dst:
-                dst.write(mask, 1)
-        meta["forest_fraction_bbox"] = float(mask.mean())
+    except Exception as e:
+        meta.setdefault("warnings", []).append(f"NLCD landcover unavailable (WCS): {e}")
+        land_ok = False
         forest_type_group_exists = False
 
-    # canopy class 0..3
-    with rasterio.open(canopy_tif) as src:
-        c = src.read(1).astype("float32")
-        cc = np.zeros_like(c, dtype="uint8")
-        cc[(c >= 10) & (c < 40)] = 1
-        cc[(c >= 40) & (c < 70)] = 2
-        cc[(c >= 70)] = 3
-        prof = src.profile.copy()
-        prof.update(dtype="uint8", count=1, nodata=0, compress="deflate", tiled=False)
-        for k in ["blockxsize","blockysize","interleave"]:
-            prof.pop(k, None)
-        with rasterio.open(canopy_class_tif, "w", **prof) as dst:
-            dst.write(cc, 1)
+        # Fallback forest mask from canopy >=10% IF canopy exists
+        if canopy_ok and os.path.exists(canopy_tif):
+            try:
+                with rasterio.open(canopy_tif) as src:
+                    c = src.read(1).astype("float32")
+                    mask = (c >= 10).astype("uint8")
+                    profile_m = src.profile.copy()
+                    profile_m.update(dtype="uint8", count=1, nodata=0, compress="deflate", tiled=False)
+                    for k in ["blockxsize","blockysize","interleave"]:
+                        profile_m.pop(k, None)
+                    with rasterio.open(forest_mask_tif, "w", **profile_m) as dst:
+                        dst.write(mask, 1)
+                meta["forest_fraction_bbox"] = float(mask.mean())
+            except Exception as e2:
+                meta.setdefault("warnings", []).append(f"Forest mask fallback from canopy failed: {e2}")
+                meta["forest_fraction_bbox"] = None
+        else:
+            meta["forest_fraction_bbox"] = None
 
-    # point diagnostics
-    meta["canopy_point_pct"] = float(sample_raster_point(canopy_tif, pt_lon, pt_lat))
-    if os.path.exists(land_tif):
-        lc_pt = int(sample_raster_point(land_tif, pt_lon, pt_lat))
-        meta["nlcd_landcover_code_point"] = lc_pt
-        meta["nlcd_landcover_label_point"] = NLCD_LEGEND.get(lc_pt, "Unknown")
-    meta["forest_mask_point"] = int(sample_raster_point(forest_mask_tif, pt_lon, pt_lat))
+    # canopy class 0..3 (optional)
+    if canopy_ok and os.path.exists(canopy_tif):
+        try:
+            with rasterio.open(canopy_tif) as src:
+                c = src.read(1).astype("float32")
+                cc = np.zeros_like(c, dtype="uint8")
+                cc[(c >= 10) & (c < 40)] = 1
+                cc[(c >= 40) & (c < 70)] = 2
+                cc[(c >= 70)] = 3
+                prof = src.profile.copy()
+                prof.update(dtype="uint8", count=1, nodata=0, compress="deflate", tiled=False)
+                for k in ["blockxsize","blockysize","interleave"]:
+                    prof.pop(k, None)
+                with rasterio.open(canopy_class_tif, "w", **prof) as dst:
+                    dst.write(cc, 1)
+        except Exception as e:
+            meta.setdefault("warnings", []).append(f"Canopy class creation failed: {e}")
+
+    # point diagnostics (guarded)
+    if canopy_ok and os.path.exists(canopy_tif):
+        try:
+            meta["canopy_point_pct"] = float(sample_raster_point(canopy_tif, pt_lon, pt_lat))
+        except Exception:
+            meta["canopy_point_pct"] = None
+    else:
+        meta["canopy_point_pct"] = None
+
+    if land_ok and os.path.exists(land_tif):
+        try:
+            lc_pt = int(sample_raster_point(land_tif, pt_lon, pt_lat))
+            meta["nlcd_landcover_code_point"] = lc_pt
+            meta["nlcd_landcover_label_point"] = NLCD_LEGEND.get(lc_pt, "Unknown")
+        except Exception:
+            pass
+
+    if os.path.exists(forest_mask_tif):
+        try:
+            meta["forest_mask_point"] = int(sample_raster_point(forest_mask_tif, pt_lon, pt_lat))
+        except Exception:
+            meta["forest_mask_point"] = None
+    else:
+        meta["forest_mask_point"] = None
 
     # forest-only NDVI mean (mask resampled to landsat)
-    fm_landsat = resample_to_profile(forest_mask_tif, landsat_prof, resampling=Resampling.nearest, dst_dtype="uint8", dst_nodata=0)
-    if float(fm_landsat.mean()) < 0.001:
-        meta["ndvi_forest_mean_bbox"] = float("nan")
-    else:
-        meta["ndvi_forest_mean_bbox"] = float(np.nanmean(np.where(fm_landsat == 1, ndvi, np.nan)))
+    try:
+        if os.path.exists(forest_mask_tif):
+            fm_landsat = resample_to_profile(
+                forest_mask_tif, landsat_prof,
+                resampling=Resampling.nearest, dst_dtype="uint8", dst_nodata=0
+            )
+            if float(fm_landsat.mean()) < 0.001:
+                meta["ndvi_forest_mean_bbox"] = float("nan")
+            else:
+                meta["ndvi_forest_mean_bbox"] = float(np.nanmean(np.where(fm_landsat == 1, ndvi, np.nan)))
+        else:
+            meta["ndvi_forest_mean_bbox"] = None
+    except Exception:
+        meta["ndvi_forest_mean_bbox"] = None
 
     # -------------------------
     # 3) gridMET point series + cleaned climate CSV
