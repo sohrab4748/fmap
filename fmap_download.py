@@ -52,6 +52,8 @@ BIOMASS_IMG = "https://imagery.geoplatform.gov/iipp/rest/services/Ecosystems/USF
 CARBON_IMG  = "https://imagery.geoplatform.gov/iipp/rest/services/Ecosystems/USFS_EDW_FIA_AboveGroundForestCarbon/ImageServer"
 FOREST_ATLAS_IMG = "https://imagery.geoplatform.gov/iipp/rest/services/Vegetation/USFS_EDW_FIA_ForestAtlas_TreeSpecies_109/ImageServer"
 
+LCMS_FASTLOSS_CONUS_IMG = "https://imagery.geoplatform.gov/iipp/rest/services/Vegetation/USFS_EDW_LCMS_YearHighestProbabilityFastLoss_CONUS/ImageServer"
+
 LB_PER_ACRE_TO_MG_PER_HA = 0.00112085116  # pounds/acre -> Mg/ha
 _geod = Geod(ellps="WGS84")
 
@@ -942,7 +944,27 @@ def run_download_pipeline(
     except Exception:
         meta["forest_atlas_layer_name"] = None
 
-    # Carbon loss proxy (placeholder): C * (MTBS != 0)
+    
+    # LCMS Fast Loss (Tree cover loss proxy) — CONUS
+    try:
+        lcms_tif = os.path.join(job_dir, "lcms_fastloss_bbox.tif")
+        _, layer_name = arcgis_export_geotiff(
+            LCMS_FASTLOSS_CONUS_IMG,
+            bbox_lonlat,
+            lcms_tif,
+            size=(size_px, size_px),
+            raster_pick_regex=r"loss|fast|prob",
+        )
+        meta["lcms_fastloss_layer_name"] = layer_name
+        try:
+            meta["lcms_fastloss_point"] = float(sample_raster_point(lcms_tif, pt_lon, pt_lat))
+        except Exception:
+            meta["lcms_fastloss_point"] = None
+    except Exception:
+        meta["lcms_fastloss_layer_name"] = None
+        meta["lcms_fastloss_point"] = None
+
+# Carbon loss proxy (placeholder): C * (MTBS != 0)
     try:
         if os.path.exists(agc_mg_tif) and os.path.exists(mtbs_tif):
             with rasterio.open(agc_mg_tif) as srcC:

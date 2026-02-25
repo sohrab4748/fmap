@@ -28,6 +28,7 @@ import faulthandler
 
 from fmap_download import run_download_pipeline, ncss_point_csv, GRIDMET_DATASETS, spi_gamma_monthly
 from fmap_analysis import run_analysis, build_manifest
+from fmap_gemini import interpret_with_gemini
 
 APP_VERSION = "0.1.1"
 JOB_ROOT = os.getenv("FMAP_JOB_ROOT", "/tmp/fmap_jobs")
@@ -402,6 +403,17 @@ class ResultResponse(BaseModel):
     download_url: Optional[str] = None
 
 
+
+class GeminiRequest(BaseModel):
+    job_id: str = Field(..., description="FMAP job id")
+    mode: str = Field("technical", description="technical | executive | public")
+    extra: Optional[str] = Field(None, description="Optional user notes / question")
+
+class GeminiResponse(BaseModel):
+    job_id: str
+    mode: str
+    text: str
+
 def _run_job(job_id: str, req: RunRequest) -> None:
     job_dir = _job_dir(job_id)
     os.makedirs(job_dir, exist_ok=True)
@@ -699,6 +711,32 @@ def result(job_id: str):
     )
 
 
+
+@app.get("/fmap/analysis_result/{job_id}")
+def analysis_result(job_id: str):
+    """Return analysis_result.json content for a finished job (same payload as ResultResponse.analysis)."""
+    meta = JOBS.get(job_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Unknown job_id")
+
+    if meta.get("status") in ("queued", "running"):
+        raise HTTPException(status_code=409, detail={"status": meta.get("status"), "message": "Not finished yet. Use /fmap/status."})
+
+    if meta.get("status") == "error":
+        raise HTTPException(status_code=500, detail={"error": meta.get("error"), "traceback": meta.get("traceback")})
+
+    a = meta.get("analysis")
+    if isinstance(a, dict) and a:
+        return a
+
+    job_dir = meta.get("job_dir") or _job_dir(job_id)
+    p = os.path.join(job_dir, "analysis_result.json")
+    if os.path.exists(p):
+        return FileResponse(p, media_type="application/json", filename="analysis_result.json")
+
+    return {}
+
+
 @app.get("/fmap/download/{job_id}")
 def download(job_id: str):
     meta = JOBS.get(job_id)
@@ -757,6 +795,29 @@ def debug_stack(job_id: str, req: Request, max_chars: int = 60000) -> Dict[str, 
 
     safe_meta = {k: v for k, v in meta.items() if k not in ("analysis", "manifest")}
     return {"job_id": job_id, "meta": safe_meta, "stack": txt}
+
+
+@app.post("/ai/gemini", response_model=GeminiResponse)
+def ai_gemini(req: GeminiRequest):
+    """Server-side Gemini interpretation of analysis_result (requires GEMINI_API_KEY env var)."""
+    meta = JOBS.get(req.job_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Unknown job_id")
+
+    if meta.get("status") in ("queued", "running"):
+        raise HTTPException(status_code=409, detail={"status": meta.get("status"), "message": "Not finished yet. Use /fmap/status."})
+
+    if meta.get("status") == "error":
+        raise HTTPException(status_code=500, detail={"error": meta.get("error"), "traceback": meta.get("traceback")})
+
+    analysis = meta.get("analysis") or {}
+    try:
+        model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
+        txt = interpret_with_gemini(analysis, mode=req.mode, model=model, extra=req.extra)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return GeminiResponse(job_id=req.job_id, mode=req.mode, text=txt)
+
 
 # ----------------------------
 # Time series helpers / API

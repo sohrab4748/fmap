@@ -53,6 +53,65 @@ def _raster_stats(tif_path: str, mask_path: Optional[str] = None, resample_mask:
     if not tif_path or not os.path.exists(tif_path):
         return out
 
+
+def _raster_hist(tif_path: str, mask_path: Optional[str] = None, resample_mask: bool = True, max_unique: int = 32) -> Dict[str, Any]:
+    """Histogram for categorical rasters; falls back to numeric histogram if too many unique values."""
+    out: Dict[str, Any] = {}
+    if not tif_path or not os.path.exists(tif_path):
+        return out
+
+    with rasterio.open(tif_path) as src:
+        arr = src.read(1).astype("float32")
+        nodata = src.nodata
+        valid = np.isfinite(arr)
+        if nodata is not None:
+            valid = valid & (arr != nodata)
+
+        if mask_path and os.path.exists(mask_path):
+            with rasterio.open(mask_path) as msrc:
+                m = msrc.read(1)
+                if resample_mask and (msrc.width != src.width or msrc.height != src.height or msrc.crs != src.crs or msrc.transform != src.transform):
+                    dst_m = np.zeros((src.height, src.width), dtype=np.uint8)
+                    reproject(
+                        source=m.astype(np.uint8),
+                        destination=dst_m,
+                        src_transform=msrc.transform,
+                        src_crs=msrc.crs,
+                        dst_transform=src.transform,
+                        dst_crs=src.crs,
+                        resampling=Resampling.nearest,
+                        src_nodata=msrc.nodata,
+                        dst_nodata=0,
+                    )
+                    m = dst_m
+                valid = valid & (m == 1)
+
+        v = arr[valid]
+        if v.size == 0:
+            return out
+
+        # Try to treat as categorical integers if values are close to integers
+        v_int = np.rint(v).astype("int32")
+        if np.nanmax(np.abs(v - v_int)) < 1e-6:
+            uniq, cnt = np.unique(v_int, return_counts=True)
+            if uniq.size <= max_unique:
+                total = int(cnt.sum())
+                counts = {int(k): int(c) for k, c in zip(uniq.tolist(), cnt.tolist())}
+                fracs = {str(int(k)): (float(c) / total if total else 0.0) for k, c in zip(uniq.tolist(), cnt.tolist())}
+                out["type"] = "categorical"
+                out["total"] = total
+                out["counts"] = counts
+                out["fractions"] = fracs
+                return out
+
+        # Numeric fallback (10 bins)
+        hist, edges = np.histogram(v.astype("float32"), bins=10)
+        out["type"] = "numeric"
+        out["bins"] = [float(x) for x in edges.tolist()]
+        out["counts"] = [int(x) for x in hist.tolist()]
+        out["total"] = int(hist.sum())
+        return out
+
     with rasterio.open(tif_path) as src:
         arr = src.read(1).astype("float32")
         nodata = src.nodata
@@ -135,6 +194,8 @@ def run_analysis(job_dir: str, request: Dict[str, Any], download_meta: Dict[str,
     agc_mg = _exists(job_dir, "fia_agc_MgHa_bbox.tif")
     agc_lb = _exists(job_dir, "fia_agc_lb_ac_bbox.tif")
     carbon_loss = _exists(job_dir, "carbon_loss_proxy_MgHa_bbox.tif")
+    lcms_fastloss = _exists(job_dir, "lcms_fastloss_bbox.tif")
+
 
     # Request basics
     pt_lon = float(request.get("pt_lon"))
@@ -167,6 +228,25 @@ def run_analysis(job_dir: str, request: Dict[str, Any], download_meta: Dict[str,
         "is_forest_point": is_forest_point,
         "note": ("Point is not NLCD forest (41/42/43); forest-only metrics are computed over nearby forest pixels within bbox." if is_forest_point is False else None),
     }
+
+
+    # Canopy structure (NLCD canopy cover %; optional canopy height if present)
+    canopy = {
+        "canopy_cover_pct_point": analysis["landcover"].get("canopy_pct_point"),
+    }
+    if canopy_tif:
+        canopy["canopy_cover_stats_bbox"] = _raster_stats(canopy_tif)
+        if forest_mask_tif:
+            canopy["canopy_cover_stats_forest"] = _raster_stats(canopy_tif, mask_path=forest_mask_tif)
+
+    # Optional canopy height (meters) if a canopy height raster was produced by the download pipeline.
+    canopy_height_tif = _exists(job_dir, "canopy_height_bbox.tif") or _exists(job_dir, "canopy_height_m_bbox.tif") or _exists(job_dir, "chm_bbox.tif")
+    if canopy_height_tif:
+        canopy["canopy_height_stats_bbox_m"] = _raster_stats(canopy_height_tif)
+        if forest_mask_tif:
+            canopy["canopy_height_stats_forest_m"] = _raster_stats(canopy_height_tif, mask_path=forest_mask_tif)
+
+    analysis["canopy"] = canopy
 
     # Vegetation indices summary
     analysis["vegetation"] = {
@@ -231,6 +311,51 @@ def run_analysis(job_dir: str, request: Dict[str, Any], download_meta: Dict[str,
         except Exception:
             pass
     analysis["disturbance"] = dist
+
+
+    # Burn severity (MTBS) summary if available
+    burn = {}
+    if mtbs_tif:
+        burn["point_value"] = _sample_tif_point(mtbs_tif, pt_lon, pt_lat)
+        burn["stats_bbox"] = _raster_stats(mtbs_tif)
+        burn["hist_bbox"] = _raster_hist(mtbs_tif, max_unique=32)
+        if forest_mask_tif:
+            burn["stats_forest"] = _raster_stats(mtbs_tif, mask_path=forest_mask_tif)
+            burn["hist_forest"] = _raster_hist(mtbs_tif, mask_path=forest_mask_tif, max_unique=32)
+    analysis["burn_severity"] = burn
+
+    # Tree cover loss / disturbance proxy from LCMS Fast Loss (if present)
+    tree_loss = {}
+    if lcms_fastloss:
+        tree_loss["layer_name"] = download_meta.get("lcms_fastloss_layer_name")
+        tree_loss["point_value"] = download_meta.get("lcms_fastloss_point") if download_meta.get("lcms_fastloss_point") is not None else _sample_tif_point(lcms_fastloss, pt_lon, pt_lat)
+        tree_loss["stats_bbox"] = _raster_stats(lcms_fastloss)
+        tree_loss["hist_bbox"] = _raster_hist(lcms_fastloss, max_unique=64)
+        if forest_mask_tif:
+            tree_loss["stats_forest"] = _raster_stats(lcms_fastloss, mask_path=forest_mask_tif)
+            tree_loss["hist_forest"] = _raster_hist(lcms_fastloss, mask_path=forest_mask_tif, max_unique=64)
+
+    # Additional simple fraction: forest pixels with MTBS burn flag != 0 (proxy "disturbed forest fraction")
+    if forest_mask_tif and mtbs_tif:
+        try:
+            with rasterio.open(forest_mask_tif) as msrc:
+                fm = msrc.read(1).astype("uint8")
+            with rasterio.open(mtbs_tif) as ssrc:
+                sev = ssrc.read(1).astype("float32")
+                snodata = ssrc.nodata
+            valid = np.isfinite(sev)
+            if snodata is not None:
+                valid = valid & (sev != snodata)
+            forest = (fm == 1)
+            forest_total = int(np.sum(forest))
+            disturbed = int(np.sum(forest & valid & (sev != 0)))
+            tree_loss["forest_pixels_total"] = forest_total
+            tree_loss["disturbed_forest_pixels"] = disturbed
+            tree_loss["disturbed_forest_fraction"] = float(disturbed / forest_total) if forest_total else None
+        except Exception:
+            pass
+
+    analysis["tree_cover_loss"] = tree_loss
 
     # Biomass / carbon
     biomass = {
