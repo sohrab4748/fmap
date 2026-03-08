@@ -25,7 +25,7 @@ import logging
 import threading
 import io
 import faulthandler
-
+from pathlib import Path
 from fmap_download import run_download_pipeline, ncss_point_csv, GRIDMET_DATASETS, spi_gamma_monthly
 from fmap_analysis import run_analysis, build_manifest
 
