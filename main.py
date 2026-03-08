@@ -24,8 +24,6 @@ from pydantic import BaseModel, Field, model_validator
 import logging
 import threading
 import io
-import json
-from pathlib import Path
 import faulthandler
 
 from fmap_download import run_download_pipeline, ncss_point_csv, GRIDMET_DATASETS, spi_gamma_monthly
@@ -58,23 +56,15 @@ if allow_creds and not origins:
     raise RuntimeError("FMAP_CORS_ORIGINS is required when FMAP_CORS_ALLOW_CREDENTIALS=true")
 
 
-def _parse_origins():
-    v = (os.getenv("FMAP_CORS_ORIGINS") or "").strip()
-    if not v or v == "*":
-        return ["*"]
-    return [o.strip() for o in v.split(",") if o.strip()]
-
-origins = _parse_origins()
-allow_credentials = False if origins == ["*"] else True
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=allow_credentials,
+    # Allow calls from any frontend origin (including file:// and custom domains).
+    # No cookies/credentials are used, so wildcard origins are safe here.
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 # Simple in-memory job store (sufficient for a single Render instance)
 JOBS: Dict[str, Dict[str, Any]] = {}
@@ -92,6 +82,295 @@ _logger = logging.getLogger("fmap")
 # Optional debug key to protect debug/stack endpoints.
 # If set, callers must send header: X-DEBUG-KEY: <value>
 DEBUG_KEY = os.getenv("FMAP_DEBUG_KEY", "").strip()
+
+# ----------------------------
+# Optional: Google Earth Engine (LANDFIRE summaries)
+# ----------------------------
+# Enable by setting: FMAP_ENABLE_EE=1 and providing a service account key.
+# Required env vars:
+#   EE_SERVICE_ACCOUNT=<service account email>
+#   EE_PRIVATE_KEY_JSON=<full JSON key contents>  OR  EE_PRIVATE_KEY_JSON_B64=<base64 of JSON key>
+#
+# LANDFIRE datasets (Earth Engine):
+#   EVT: ee.ImageCollection("LANDFIRE/Vegetation/EVT/v1_4_0")  band: EVT  (30 m)
+#   EVC: ee.ImageCollection("LANDFIRE/Vegetation/EVC/v1_4_0")  band: EVC  (30 m)
+#   EVH: ee.ImageCollection("LANDFIRE/Vegetation/EVH/v1_4_0")  band: EVH  (30 m)
+#
+# Reference (band names and product description):
+#   EVT: https://developers.google.com/earth-engine/datasets/catalog/LANDFIRE_Vegetation_EVT_v1_4_0
+#   EVC: https://developers.google.com/earth-engine/datasets/catalog/LANDFIRE_Vegetation_EVC_v1_4_0
+#   EVH: https://developers.google.com/earth-engine/datasets/catalog/LANDFIRE_Vegetation_EVH_v1_4_0
+try:
+    import ee  # type: ignore
+except Exception:
+    ee = None  # type: ignore
+
+EE_ENABLED = os.getenv("FMAP_ENABLE_EE", "0").strip().lower() in ("1", "true", "yes")
+_EE_LOCK = threading.Lock()
+_EE_INIT_DONE = False
+_EE_INIT_ERROR: Optional[str] = None
+
+# Optional EVT lookup CSV (Value -> Description/Name). If not present, UI will show EVT codes.
+# Put the file in the repo root (same folder as main.py) or set FMAP_LANDFIRE_EVT_CSV to an absolute path.
+LANDFIRE_EVT_CSV = os.getenv("FMAP_LANDFIRE_EVT_CSV", "").strip() or str(Path(__file__).with_name("landfire_evt_lookup.csv"))
+_LANDFIRE_EVT_LOOKUP: Optional[Dict[int, str]] = None
+
+
+def _ee_init_if_needed() -> None:
+    """Initialize Earth Engine once per process (service-account auth)."""
+    global _EE_INIT_DONE, _EE_INIT_ERROR
+    if _EE_INIT_DONE:
+        return
+    with _EE_LOCK:
+        if _EE_INIT_DONE:
+            return
+        if not EE_ENABLED:
+            _EE_INIT_ERROR = "FMAP_ENABLE_EE is not enabled"
+            _EE_INIT_DONE = True
+            return
+        if ee is None:
+            _EE_INIT_ERROR = "earthengine-api is not installed"
+            _EE_INIT_DONE = True
+            return
+
+        sa = os.getenv("EE_SERVICE_ACCOUNT", "").strip()
+        key_json = os.getenv("EE_PRIVATE_KEY_JSON", "").strip()
+        key_b64 = os.getenv("EE_PRIVATE_KEY_JSON_B64", "").strip()
+        if not sa or (not key_json and not key_b64):
+            _EE_INIT_ERROR = "Missing EE_SERVICE_ACCOUNT and/or EE_PRIVATE_KEY_JSON(_B64)"
+            _EE_INIT_DONE = True
+            return
+
+        try:
+            if key_b64 and not key_json:
+                key_json = base64.b64decode(key_b64.encode("utf-8")).decode("utf-8")
+
+            # Write key to a private file under JOB_ROOT (safe on Render; file only in container)
+            key_path = Path(JOB_ROOT) / "_ee_service_key.json"
+            key_path.write_text(key_json, encoding="utf-8")
+
+            creds = ee.ServiceAccountCredentials(sa, str(key_path))
+            ee.Initialize(credentials=creds)
+            _EE_INIT_ERROR = None
+        except Exception as e:
+            _EE_INIT_ERROR = f"EE init failed: {type(e).__name__}: {e}"
+        finally:
+            _EE_INIT_DONE = True
+
+
+def _landfire_evt_lookup_load() -> Dict[int, str]:
+    """Load EVT lookup CSV if present. Expected columns include 'Value' and 'Description' (or similar)."""
+    global _LANDFIRE_EVT_LOOKUP
+    if _LANDFIRE_EVT_LOOKUP is not None:
+        return _LANDFIRE_EVT_LOOKUP
+
+    lookup: Dict[int, str] = {}
+    try:
+        p = Path(LANDFIRE_EVT_CSV)
+        if p.exists():
+            import csv
+            with p.open("r", encoding="utf-8", newline="") as f:
+                reader = csv.DictReader(f)
+                # Accept common column names from LANDFIRE tables
+                for row in reader:
+                    v = row.get("Value") or row.get("VALUE") or row.get("value")
+                    d = row.get("Description") or row.get("DESCRIPTION") or row.get("EVT_NAME") or row.get("EVT_Desc") or row.get("Label") or row.get("label")
+                    if v is None or d is None:
+                        continue
+                    try:
+                        code = int(float(v))
+                    except Exception:
+                        continue
+                    name = str(d).strip()
+                    if name:
+                        lookup[code] = name
+    except Exception:
+        lookup = {}
+
+    _LANDFIRE_EVT_LOOKUP = lookup
+    return lookup
+
+
+def _ee_geom_from_bbox(minlon: float, minlat: float, maxlon: float, maxlat: float):
+    return ee.Geometry.Rectangle([minlon, minlat, maxlon, maxlat], proj=None, geodesic=False)
+
+
+def _ee_landfire_summary(minlon: float, minlat: float, maxlon: float, maxlat: float, pt_lon: float, pt_lat: float) -> Dict[str, Any]:
+    """Return LANDFIRE EVT/EVC/EVH point + bbox summary (small JSON)."""
+    _ee_init_if_needed()
+    if _EE_INIT_ERROR or (ee is None):
+        return {"available": False, "reason": _EE_INIT_ERROR or "EE not available"}
+
+    try:
+        geom = _ee_geom_from_bbox(minlon, minlat, maxlon, maxlat)
+        pt = ee.Geometry.Point([pt_lon, pt_lat])
+
+        # Datasets and bands (documented in EE catalog)
+        evt_img = ee.ImageCollection("LANDFIRE/Vegetation/EVT/v1_4_0").mosaic().select("EVT")
+        evc_img = ee.ImageCollection("LANDFIRE/Vegetation/EVC/v1_4_0").mosaic().select("EVC")
+        evh_img = ee.ImageCollection("LANDFIRE/Vegetation/EVH/v1_4_0").mosaic().select("EVH")
+
+        scale = 30
+
+        # Point values
+        evt_point = evt_img.reduceRegion(reducer=ee.Reducer.first(), geometry=pt, scale=scale, maxPixels=1e7).get("EVT")
+        evc_point = evc_img.reduceRegion(reducer=ee.Reducer.first(), geometry=pt, scale=scale, maxPixels=1e7).get("EVC")
+        evh_point = evh_img.reduceRegion(reducer=ee.Reducer.first(), geometry=pt, scale=scale, maxPixels=1e7).get("EVH")
+
+        # EVT histogram over bbox
+        evt_hist = evt_img.reduceRegion(reducer=ee.Reducer.frequencyHistogram(), geometry=geom, scale=scale, maxPixels=1e9).get("EVT")
+
+        # Percentiles for EVC/EVH over bbox (min/p10/p50/mean/p90/max)
+        red = ee.Reducer.minMax().combine(ee.Reducer.mean(), "", True).combine(ee.Reducer.percentile([10, 50, 90]), "", True)
+        evc_stats = evc_img.reduceRegion(reducer=red, geometry=geom, scale=scale, maxPixels=1e9)
+        evh_stats = evh_img.reduceRegion(reducer=red, geometry=geom, scale=scale, maxPixels=1e9)
+
+        # Convert server objects to client JSON
+        evt_point_v = ee.Number(evt_point).getInfo() if evt_point is not None else None
+        evc_point_v = ee.Number(evc_point).getInfo() if evc_point is not None else None
+        evh_point_v = ee.Number(evh_point).getInfo() if evh_point is not None else None
+        evt_hist_d = ee.Dictionary(evt_hist).getInfo() if evt_hist is not None else {}
+
+        evc_d = evc_stats.getInfo() if evc_stats is not None else {}
+        evh_d = evh_stats.getInfo() if evh_stats is not None else {}
+
+        def _pack_stats(d: Dict[str, Any], band: str) -> Dict[str, Any]:
+            # keys like EVC_min, EVC_max, EVC_mean, EVC_p10, EVC_p50, EVC_p90
+            out = {
+                "min": d.get(f"{band}_min"),
+                "p10": d.get(f"{band}_p10"),
+                "p50": d.get(f"{band}_p50"),
+                "mean": d.get(f"{band}_mean"),
+                "p90": d.get(f"{band}_p90"),
+                "max": d.get(f"{band}_max"),
+            }
+            return out
+
+        # Convert histogram to top-k list (by count)
+        hist_items = []
+        total = 0
+        for k, v in (evt_hist_d or {}).items():
+            try:
+                code = int(float(k))
+                cnt = int(v)
+            except Exception:
+                continue
+            total += cnt
+            hist_items.append((code, cnt))
+        hist_items.sort(key=lambda t: t[1], reverse=True)
+        lookup = _landfire_evt_lookup_load()
+        top = []
+        for code, cnt in hist_items[:25]:
+            top.append({
+                "code": code,
+                "name": lookup.get(code),
+                "count": cnt,
+                "pct": (100.0 * cnt / total) if total else None,
+            })
+
+        out = {
+            "available": True,
+            "source": "LANDFIRE v1.4.0 (GEE)",
+            "scale_m": scale,
+            "evt_point": {"code": int(evt_point_v) if evt_point_v is not None else None, "name": lookup.get(int(evt_point_v)) if evt_point_v is not None else None},
+            "evc_point_pct": evc_point_v,
+            "evh_point_m": evh_point_v,
+            "evt_top_bbox": top,
+            "evc_bbox_pct": _pack_stats(evc_d, "EVC"),
+            "evh_bbox_m": _pack_stats(evh_d, "EVH"),
+        }
+        return out
+    except Exception as e:
+        return {"available": False, "reason": f"LANDFIRE summary failed: {type(e).__name__}: {e}"}
+
+
+class FirelandRequest(BaseModel):
+    geojson: Dict[str, Any] = Field(..., description="GeoJSON geometry or Feature/FeatureCollection")
+    n_samples: int = Field(500, ge=50, le=5000)
+    seed: int = 0
+    min_evc: float = Field(30.0, ge=0.0, le=100.0, description="Min canopy cover (%)")
+    min_evh: float = Field(2.0, ge=0.0, le=100.0, description="Min vegetation height (m)")
+    top_k: int = Field(200, ge=10, le=2000)
+
+
+def _geojson_to_geometry(gj: Dict[str, Any]):
+    # Accept Geometry, Feature, FeatureCollection (use first feature)
+    if not isinstance(gj, dict):
+        raise ValueError("geojson must be an object")
+    if gj.get("type") == "FeatureCollection":
+        feats = gj.get("features") or []
+        if not feats:
+            raise ValueError("FeatureCollection has no features")
+        gj = feats[0]
+    if gj.get("type") == "Feature":
+        geom = gj.get("geometry")
+        if not geom:
+            raise ValueError("Feature has no geometry")
+        gj = geom
+    if "type" not in gj or "coordinates" not in gj:
+        raise ValueError("Invalid GeoJSON geometry")
+    return ee.Geometry(gj)
+
+
+def _fireland_candidates(req: FirelandRequest) -> Dict[str, Any]:
+    """Sample candidate points inside AOI and rank by a simple LANDFIRE fuel-structure score."""
+    _ee_init_if_needed()
+    if _EE_INIT_ERROR or (ee is None):
+        return {"available": False, "reason": _EE_INIT_ERROR or "EE not available"}
+
+    geom = _geojson_to_geometry(req.geojson)
+    scale = 30
+
+    evt_img = ee.ImageCollection("LANDFIRE/Vegetation/EVT/v1_4_0").mosaic().select("EVT")
+    evc_img = ee.ImageCollection("LANDFIRE/Vegetation/EVC/v1_4_0").mosaic().select("EVC")
+    evh_img = ee.ImageCollection("LANDFIRE/Vegetation/EVH/v1_4_0").mosaic().select("EVH")
+
+    img = evt_img.addBands(evc_img).addBands(evh_img)
+
+    # Random points
+    pts = ee.FeatureCollection.randomPoints(region=geom, points=req.n_samples, seed=req.seed, maxError=1)
+    samples = img.sampleRegions(collection=pts, scale=scale, geometries=True)
+
+    # Pull back to client (limit)
+    fc = samples.limit(int(req.top_k)).getInfo()
+    feats = fc.get("features", []) if isinstance(fc, dict) else []
+
+    # Rank in python for transparency (score = 0.6*EVC + 0.4*min(EVH/30,1)*100)
+    out_feats = []
+    lookup = _landfire_evt_lookup_load()
+    for f in feats:
+        props = f.get("properties", {}) or {}
+        geomj = f.get("geometry", {}) or {}
+        try:
+            evc = float(props.get("EVC")) if props.get("EVC") is not None else None
+            evh = float(props.get("EVH")) if props.get("EVH") is not None else None
+            evt = int(float(props.get("EVT"))) if props.get("EVT") is not None else None
+        except Exception:
+            continue
+        if evc is None or evh is None:
+            continue
+        if evc < req.min_evc or evh < req.min_evh:
+            continue
+        score = 0.6 * (evc / 100.0) + 0.4 * min(evh / 30.0, 1.0)
+        out_feats.append({
+            "type": "Feature",
+            "geometry": geomj,
+            "properties": {
+                "score": round(score, 4),
+                "evc_pct": evc,
+                "evh_m": evh,
+                "evt_code": evt,
+                "evt_name": lookup.get(evt),
+            }
+        })
+
+    out_feats.sort(key=lambda f: f["properties"]["score"], reverse=True)
+    return {
+        "available": True,
+        "scale_m": scale,
+        "n_returned": min(len(out_feats), req.top_k),
+        "features": out_feats[: req.top_k],
+    }
 
 
 def _require_debug_key(req: Request) -> None:
@@ -191,210 +470,6 @@ def _largest_files(job_dir: str, top_n: int = 8) -> List[Dict[str, Any]]:
         return rows[: max(1, min(int(top_n), 50))]
     except Exception:
         return []
-
-
-
-# ----------------------------
-# Description.txt generation (run metadata + chart/field dictionary)
-# ----------------------------
-DESCRIPTION_FILENAME = "description.txt"
-ANALYSIS_JSON_FILENAME = "analysis_result.json"
-DESCRIPTION_TEMPLATE_FILENAME = "FMAP_Analysis_Catalog.txt"
-
-# Built-in fallback template (used only if DESCRIPTION_TEMPLATE_FILENAME is not found in the repo).
-_DESCRIPTION_TEMPLATE_FALLBACK = "FMAP-AI \u2014 Analysis & Output Catalog (Prototype)\nGenerated: 2026-02-25 18:41:24\n\nPurpose\nThis file documents the analyses, derived indices, chart panels, and ZIP output items produced by\nthe FMAP-AI prototype. It is intended to help reviewers (e.g., a professor evaluating a funding\nopportunity) understand what each chart represents, where the data come from, and which outputs are\ndownloaded vs computed.\n\n========================================================================================\n1) Run Inputs (from analysis_result.json \u2192 request)\n- pt_lon: -93.65\n- pt_lat: 42.03\n- minlon: -93.67418734481853\n- minlat: 42.01203377650018\n- maxlon: -93.62581265518148\n- maxlat: 42.04796622349982\n- date_start: 2026-01-11\n- date_end: 2026-02-20\n- spi_start: 2021-01-01\n- cloud_cover_lt: 60.0\n- keep_rasters: False\n- include_zip: True\n- size_px: 512\n- selection: point\n- region_n_samples: 9\n- region_sample_strategy: grid\n\n========================================================================================\n2) Data Sources (Downloaded Inputs)\n  - GridMET daily weather (via THREDDS/NCSS point subsetting): precipitation, temperature, vapor pressure deficit, and optional fire-weather variables.\n  - Landsat 8/9 Collection 2 Level-2 scenes (via STAC / Planetary Computer): used to compute NDVI/NDMI/NBR over the bbox and at the point.\n  - NLCD Land Cover + NLCD Tree Canopy (USGS MRLC services): used to determine forest mask and canopy percent.\n  - WFIGS fire perimeters (vector): used to detect recent fires and compute burned area intersecting the bbox.\n  - MTBS burn severity (raster mosaic): used to summarize burn severity over bbox when available.\n  - Forest biomass/carbon rasters (e.g., FIA-based aboveground biomass, aboveground carbon): used for point values and forest-only distributions.\n  - Optional: LCMS disturbance / tree cover loss (if enabled in backend).\n\n========================================================================================\n3) Derived / Computed Indices (Computed from downloaded inputs)\n  - Vegetation indices (from Landsat reflectance):\n  -   \u2022 NDVI = (NIR - Red) / (NIR + Red) \u2014 vegetation greenness.\n  -   \u2022 NDMI = (NIR - SWIR1) / (NIR + SWIR1) \u2014 vegetation moisture proxy.\n  -   \u2022 NBR  = (NIR - SWIR2) / (NIR + SWIR2) \u2014 burn / disturbance proxy.\n  - Climate summaries (from GridMET point series): totals and means over the selected date range.\n  - SPI-30 (optional / supporting drought context): computed from precipitation series using robust fitting + fallbacks.\n  - Fire/forest weather indices (GridMET-only, if enabled in your build):\n  -   \u2022 KBDI (Keetch\u2013Byram Drought Index): duff/fuel dryness proxy (0\u2013800 scale).\n  -   \u2022 HDW proxy = VPD \u00d7 Wind: hot-dry-windy severity indicator.\n  -   \u2022 ERC / BI / Fuel Moisture metrics (FM100, FM1000): operational fire-danger variables when present in GridMET download.\n\n========================================================================================\n4) Analyses / Metrics (Analysis summaries used by charts)\nThese metrics are typically stored in analysis_result.json. Availability depends on data coverage and whether the\nselected point is classified as forest by NLCD (forest-only metrics are computed over nearby forest pixels in the bbox).\n\n4.1 Landcover / Forest context\n  - NLCD class at point: 24 \u2014 Developed, High Intensity\n  - Is forest at point: False\n  - Forest fraction inside bbox: 0.108154296875\n  - Canopy % at point (NLCD tree canopy): canopy_pct_point\n  - Forest mask point: forest_mask_point (1=forest, 0=non-forest)\n  - Note: forest-only distributions use the forest mask within the bbox.\n\n4.2 Vegetation (Landsat)\n  - Selected Landsat scene: LC09_L2SP_027031_20260131_02_T1 (cloud_cover=0.7)\n  - Point + bbox-mean for NDVI, NDMI, NBR\n  - NDVI distribution stats over bbox (min/max/mean/p10/p50/p90/count) if computed\n  - NDVI distribution stats over forest-only pixels if forest exists in bbox\n\n4.3 Climate (GridMET point series)\n  - Precipitation total (mm) and mean (mm/day)\n  - Tmax/Tmin/Tmean means (\u00b0C) over selected date range\n  - VPD mean over selected date range (units as provided by GridMET variable; verify scaling in your backend if needed)\n  - n_days: number of daily records\n\n4.4 Drought (supporting)\n  - SPI-30 summary stats (mean/min/max/last/n).\n  - Note: SPI is included as drought context; fire/forest risk is better captured by VPD, ETo, fuel moisture, KBDI, ERC/BI.\n\n4.5 Disturbance / Fire\n  - WFIGS perimeters in bbox: wfigs_features_in_bbox\n  - Burned area summary (km\u00b2) derived from perimeters intersecting bbox\n  - MTBS burn severity raster layer name (if an MTBS raster matched) + severity statistics/histograms when enabled\n\n4.6 Biomass & Carbon\n  - AGB point value (lb/ac and Mg/ha) + forest-only distribution stats within bbox when available\n  - AGC (aboveground carbon) point value (lb/ac and Mg/ha) + forest-only distribution stats within bbox when available\n  - Note: if point is not forest, point AGB/AGC may be less meaningful; distributions over nearby forest pixels are preferred.\n\n4.7 Carbon loss proxy (experimental)\n  - A simple proxy layer (often based on disturbance mask \u00d7 carbon) summarized with percentiles.\n  - If disturbance/loss is absent, values may be zero.\n\n========================================================================================\n5) Chart Panels (What each chart represents + required data)\n\n5.1 Climate / Weather\n  - Daily precipitation (bar/line): from GridMET precipitation point series.\n  - Daily Tmax/Tmin/Tmean (line): from GridMET temperature point series.\n  - Daily VPD / ETo / Wind (line): from GridMET point series (if downloaded).\n  - SPI-30 (line): computed from precipitation series (optional).\n\n5.2 Vegetation (Landsat)\n  - NDVI/NDMI/NBR point and bbox mean (numbers + small chart): derived from Landsat scene over bbox.\n  - NDVI distribution over bbox (histogram/box/percentiles): requires NDVI stats or histogram computed over bbox.\n  - NDVI distribution over forest-only pixels: requires NLCD forest mask + NDVI raster stats.\n\n5.3 Forest Structure & Biomass\n  - Canopy cover (if available): from NLCD canopy WCS (point + bbox stats).\n  - Canopy height (future): requires a canopy height data source (e.g., GEDI-derived canopy height) \u2014 not in baseline.\n  - AGB & AGC distributions: from biomass/carbon rasters, summarized over forest pixels in bbox.\n\n5.4 Disturbance / Tree loss / Burn\n  - Fire perimeters & burned area: from WFIGS perimeters intersecting bbox.\n  - Burn severity: from MTBS burn severity raster (only if fire occurred and MTBS data available).\n  - Tree cover loss / disturbance (if enabled): from LCMS or similar disturbance product; used to compute loss metrics and carbon-loss proxy.\n\n5.5 Fire / Forest Weather (GridMET-only, recommended for forestry)\n  - KBDI (0\u2013800): computed from daily Tmax + precip + normal annual precip baseline.\n  - HDW proxy (VPD \u00d7 Wind): computed from GridMET VPD and wind speed.\n  - ERC and BI: downloaded GridMET operational fire-danger indices (if available).\n  - Fuel moisture (FM100/FM1000): downloaded from GridMET (if available).\n\n========================================================================================\n6) ZIP Output Items (Download bundle)\nThe ZIP is intended for reproducibility and offline review. Exact files depend on keep_rasters/include_zip flags\nand data availability. Typical items:\n\n6.1 Always included (recommended)\n  - analysis_result.json \u2014 single JSON summary used by the frontend to populate cards/charts.\n  - climate_point_clean.csv \u2014 daily point time series (precip/temp/VPD and any extra variables).\n  - spi30_point.csv \u2014 SPI-30 time series (if SPI enabled in backend).\n  - job.log / state.json \u2014 debug metadata (optional but helpful).\n\n6.2 Included when fire products are available\n  - wfigs_perimeters_bbox.geojson \u2014 fire perimeters intersecting bbox (if any).\n  - burned_area_from_perimeters.csv \u2014 table of burned area by perimeter and totals.\n\n6.3 Included when rasters are enabled or needed for review (keep_rasters=true)\n  - ndvi_bbox.tif / ndmi_bbox.tif / nbr_bbox.tif \u2014 vegetation index rasters over bbox (optional).\n  - nlcd_landcover_bbox.tif / nlcd_canopy_bbox.tif \u2014 landcover/canopy rasters (optional).\n  - mtbs_burn_severity_bbox.tif \u2014 burn severity raster over bbox (optional).\n  - fia_agb_raw_bbox.tif \u2014 aboveground biomass raster over bbox (optional).\n  - agc_*_bbox.tif \u2014 aboveground carbon raster over bbox (optional).\n  - lcms_tree_loss_bbox.tif \u2014 tree cover loss/disturbance raster (optional, if enabled).\n\n========================================================================================\n7) Notes on Missing/Empty Charts (Expected behavior)\n  - Some panels legitimately show 'not available' when a data source is temporarily offline (e.g., NLCD WCS 503).\n  - Some panels are empty when the point/bbox is not forest (NLCD class not 41/42/43) or when there is no fire in the bbox.\n  - Very recent date ranges may yield no Landsat scenes under a strict cloud filter; widening the date range/bbox improves success.\n  - On free Render instances, keep_rasters=true or large bbox/time ranges can exceed /tmp storage; prefer keep_rasters=false for demos.\n\n========================================================================================\n8) JSON Schema Summary (analysis_result.json keys)\nTop-level keys present in current example:\n  - generated_at, request, download_meta, point, bbox, landcover, vegetation, climate, spi30, disturbance, biomass_carbon, carbon_loss_proxy\n\nKey highlights from current example (for reference):\n  - landcover.nlcd_label_point = Developed, High Intensity\n  - vegetation.ndvi_stats_bbox.count = 17688\n  - climate.n_days = 41\n  - disturbance.wfigs_features_in_bbox = 0\n  - biomass_carbon.agb.layer_name = dry_biomass_aboveground_01\n"
-
-def _load_description_template_text() -> str:
-    """Load a human-readable template for what the tool produces.
-
-    If you commit FMAP_Analysis_Catalog.txt to your backend repo root, it will be used.
-    Otherwise, a built-in fallback template is used.
-    """
-    try:
-        here = Path(__file__).resolve().parent
-        p = here / DESCRIPTION_TEMPLATE_FILENAME
-        if p.exists():
-            return p.read_text(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
-    return _DESCRIPTION_TEMPLATE_FALLBACK
-
-
-def _flatten_json_paths(obj: Any, prefix: str = "") -> List[Tuple[str, Any]]:
-    """Return (path, value) pairs for dict/list trees."""
-    out: List[Tuple[str, Any]] = []
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            p = f"{prefix}.{k}" if prefix else str(k)
-            out.extend(_flatten_json_paths(v, p))
-        return out
-    if isinstance(obj, list):
-        # Don't explode huge arrays; keep only summary.
-        out.append((prefix, obj))
-        return out
-    out.append((prefix, obj))
-    return out
-
-
-def _summarize_value(v: Any) -> str:
-    if v is None:
-        return "null"
-    if isinstance(v, (str, int, float, bool)):
-        s = str(v)
-        return s if len(s) <= 120 else s[:117] + "..."
-    if isinstance(v, dict):
-        return f"object(keys={len(v)})"
-    if isinstance(v, list):
-        return f"list(len={len(v)})"
-    return str(type(v).__name__)
-
-
-def _path_kind(path: str) -> str:
-    """Classify fields into input/downloaded/analysis/meta."""
-    if path == "generated_at":
-        return "meta"
-    if path.startswith("request."):
-        return "input"
-    if path.startswith("download_meta."):
-        return "downloaded"
-    if path.startswith("point.") or path.startswith("bbox."):
-        return "input"
-    return "analysis"
-
-
-def _path_chart_group(path: str) -> str:
-    if path.startswith("climate."):
-        return "Climate"
-    if path.startswith("spi30."):
-        return "Drought"
-    if path.startswith("vegetation."):
-        return "Vegetation"
-    if path.startswith("landcover.") or path.startswith("canopy."):
-        return "Landcover/Canopy"
-    if path.startswith("disturbance.") or path.startswith("burn_severity."):
-        return "Fire/Burn"
-    if path.startswith("tree_cover_loss."):
-        return "Tree loss"
-    if path.startswith("biomass_carbon."):
-        return "Biomass/Carbon"
-    if path.startswith("carbon_loss_proxy."):
-        return "Carbon loss"
-    return "Other"
-
-
-# Known field descriptions + units (fallback when available)
-_FIELD_INFO: Dict[str, Dict[str, str]] = {
-    "climate.pr_total_mm": {"units": "mm", "desc": "Total precipitation over date_start–date_end (GridMET point)."},
-    "climate.pr_mean_mm_per_day": {"units": "mm/day", "desc": "Mean daily precipitation over date_start–date_end (GridMET point)."},
-    "climate.tmax_mean_C": {"units": "°C", "desc": "Mean daily maximum air temperature over date_start–date_end (GridMET point)."},
-    "climate.tmin_mean_C": {"units": "°C", "desc": "Mean daily minimum air temperature over date_start–date_end (GridMET point)."},
-    "climate.tmean_mean_C": {"units": "°C", "desc": "Mean daily average air temperature over date_start–date_end (GridMET point)."},
-    "climate.vpd_mean": {"units": "kPa (check scaling)", "desc": "Mean vapor pressure deficit over date_start–date_end (GridMET point)."},
-    "spi30.mean": {"units": "SPI", "desc": "Mean SPI-30 over date_start–date_end (computed from precip series)."},
-    "vegetation.ndvi.point": {"units": "-", "desc": "NDVI at selected point from chosen Landsat scene."},
-    "vegetation.ndvi.bbox_mean": {"units": "-", "desc": "Mean NDVI over bbox from chosen Landsat scene."},
-    "vegetation.ndmi.point": {"units": "-", "desc": "NDMI at selected point from chosen Landsat scene."},
-    "vegetation.nbr.point": {"units": "-", "desc": "NBR at selected point from chosen Landsat scene."},
-    "landcover.nlcd_label_point": {"units": "", "desc": "NLCD landcover class label at the selected point."},
-    "canopy.canopy_cover_pct_point": {"units": "%", "desc": "NLCD tree canopy cover percent at the selected point (if available)."},
-    "burn_severity.hist_bbox": {"units": "", "desc": "Categorical histogram of burn severity class values in bbox (MTBS)."},
-    "tree_cover_loss.layer_name": {"units": "", "desc": "Tree cover loss layer used (e.g., LCMS fast-loss product)."},
-    "biomass_carbon.agb.layer_name": {"units": "", "desc": "Aboveground biomass raster layer name used for AGB metrics."},
-    "biomass_carbon.agc.layer_name": {"units": "", "desc": "Aboveground carbon raster layer name used for AGC metrics."},
-}
-
-
-def _field_units(path: str) -> str:
-    info = _FIELD_INFO.get(path)
-    return info.get("units", "") if info else ""
-
-
-def _field_desc(path: str) -> str:
-    info = _FIELD_INFO.get(path)
-    if info and info.get("desc"):
-        return info["desc"]
-    g = _path_chart_group(path)
-    if path.startswith("download_meta."):
-        return "Download/pipeline metadata captured during the run."
-    if g == "Other":
-        return "Derived metric or metadata (see analysis_result.json)."
-    return f"{g} metric used by charts and summary panels."
-
-
-def _write_description_txt(job_id: str, job_dir: str) -> str:
-    """Create a per-job description.txt (template + dynamic dictionary + output file list)."""
-    job_dir_p = Path(job_dir)
-    analysis_path = job_dir_p / ANALYSIS_JSON_FILENAME
-
-    # Load analysis_result.json (if missing, write a minimal stub).
-    if not analysis_path.exists():
-        try:
-            analysis_path.write_text(_json_dumps({"generated_at": _utc_now()}), encoding="utf-8")
-        except Exception:
-            pass
-
-    try:
-        analysis_obj = json.loads(analysis_path.read_text(encoding="utf-8", errors="replace"))
-    except Exception:
-        analysis_obj = {}
-
-    template = _load_description_template_text()
-
-    pairs = _flatten_json_paths(analysis_obj)
-    pairs.sort(key=lambda kv: kv[0])
-
-    lines: List[str] = []
-    lines.append(f"FMAP-AI — Run Description (job_id={job_id})")
-    lines.append(f"Generated: {_utc_now()}")
-    lines.append("")
-    lines.append(f"API links:")
-    lines.append(f"  - analysis_result.json: /fmap/analysis_result/{job_id}")
-    lines.append(f"  - description.txt:     /fmap/description/{job_id}")
-    lines.append(f"  - zip (if enabled):    /fmap/download/{job_id}")
-    lines.append("")
-    lines.append("=" * 88)
-    lines.append("A) Overview Template")
-    lines.append(template.strip())
-    lines.append("")
-    lines.append("=" * 88)
-    lines.append("B) Run-specific field dictionary (from analysis_result.json)")
-    lines.append("Legend: kind = input | downloaded | analysis | meta")
-    lines.append("")
-
-    for path, value in pairs:
-        kind = _path_kind(path)
-        group = _path_chart_group(path)
-        units = _field_units(path)
-        desc = _field_desc(path)
-        val = _summarize_value(value)
-        lines.append(f"- {path}")
-        lines.append(f"    kind: {kind} | group: {group}" + (f" | units: {units}" if units else ""))
-        lines.append(f"    value: {val}")
-        lines.append(f"    desc: {desc}")
-
-    lines.append("")
-    lines.append("=" * 88)
-    lines.append("C) Output files present in job directory (these are what the ZIP contains)")
-    try:
-        rows = []
-        for fp in job_dir_p.rglob("*"):
-            if fp.is_file():
-                rel = fp.relative_to(job_dir_p).as_posix()
-                try:
-                    sz = fp.stat().st_size
-                except Exception:
-                    sz = 0
-                rows.append((rel, sz))
-        rows.sort(key=lambda r: r[0])
-        for rel, sz in rows:
-            lines.append(f"- {rel} ({sz/1024:.1f} KB)")
-    except Exception as e:
-        lines.append(f"(Unable to list output files: {e})")
-
-    out_path = job_dir_p / DESCRIPTION_FILENAME
-    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return str(out_path)
-
 
 
 def _clean_success_outputs(job_dir: str) -> None:
@@ -614,8 +689,6 @@ class ResultResponse(BaseModel):
     analysis: Dict[str, Any]
     manifest: Dict[str, Any]
     download_url: Optional[str] = None
-    analysis_result_url: Optional[str] = None
-    description_url: Optional[str] = None
 
 
 def _run_job(job_id: str, req: RunRequest) -> None:
@@ -690,6 +763,29 @@ def _run_job(job_id: str, req: RunRequest) -> None:
         analysis = run_analysis(job_dir=job_dir, request=req.model_dump(), download_meta=download_meta)
         _job_event(job_id, "analysis:done", "Analysis finished")
 
+        # Optional: LANDFIRE (EVT/EVC/EVH) summaries via Google Earth Engine (adds forestry context)
+        try:
+            lf = _ee_landfire_summary(
+                minlon=req.minlon,
+                minlat=req.minlat,
+                maxlon=req.maxlon,
+                maxlat=req.maxlat,
+                pt_lon=req.pt_lon,
+                pt_lat=req.pt_lat,
+            )
+            if isinstance(analysis, dict):
+                analysis["landfire"] = lf
+            # Persist updated analysis to a file for ZIP/links
+            try:
+                ap = os.path.join(job_dir, "analysis_result.json")
+                with open(ap, "w", encoding="utf-8") as f:
+                    json.dump(analysis, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+        except Exception as e:
+            if isinstance(analysis, dict):
+                analysis["landfire"] = {"available": False, "reason": f"LANDFIRE integration failed: {e}"}
+
         # --- Optional time-series products (point and/or region) ---
         ts_warnings: List[str] = []
         try:
@@ -719,13 +815,6 @@ def _run_job(job_id: str, req: RunRequest) -> None:
                 f"({prune_report.get('after_bytes', 0)/1024**2:.1f} MB). "
                 "Try keep_rasters=false, reduce bbox/size_px, or upgrade to a persistent-disk instance."
             )
-
-        # Write per-job description.txt (template + dynamic dictionary of analysis_result.json keys)
-        try:
-            desc_path = _write_description_txt(job_id, job_dir)
-            JOBS[job_id]["description_path"] = desc_path
-        except Exception as e:
-            _job_event(job_id, "description:warn", f"Failed to write description.txt: {e}")
 
         manifest = build_manifest(job_dir)
 
@@ -838,8 +927,6 @@ def run(req: RunRequest, background: BackgroundTasks):
         started_at=JOBS[job_id]["started_at"],
         result_url=f"/fmap/result/{job_id}",
         download_url=download_url,
-        analysis_result_url=f"/fmap/analysis_result/{job_id}",
-        description_url=f"/fmap/description/{job_id}",
     )
 
 
@@ -873,8 +960,6 @@ def run_sync(req: RunRequest):
         analysis=meta["analysis"],
         manifest=meta["manifest"],
         download_url=download_url,
-        analysis_result_url=f"/fmap/analysis_result/{job_id}",
-        description_url=f"/fmap/description/{job_id}",
     )
 
 
@@ -923,8 +1008,6 @@ def result(job_id: str):
         analysis=meta["analysis"],
         manifest=meta["manifest"],
         download_url=download_url,
-        analysis_result_url=f"/fmap/analysis_result/{job_id}",
-        description_url=f"/fmap/description/{job_id}",
     )
 
 
@@ -939,33 +1022,6 @@ def download(job_id: str):
         raise HTTPException(status_code=404, detail="ZIP not available for this job (run with include_zip=true).")
 
     return FileResponse(zip_path, media_type="application/zip", filename=os.path.basename(zip_path))
-
-
-@app.get("/fmap/analysis_result/{job_id}")
-def analysis_result(job_id: str):
-    """Return analysis_result.json for a completed job."""
-    meta = JOBS.get(job_id)
-    if not meta:
-        raise HTTPException(status_code=404, detail="Unknown job_id")
-    job_dir = meta.get("job_dir") or _job_dir(job_id)
-    p = os.path.join(job_dir, ANALYSIS_JSON_FILENAME)
-    if not os.path.exists(p):
-        raise HTTPException(status_code=404, detail="analysis_result.json not found for this job")
-    return FileResponse(p, media_type="application/json", filename=ANALYSIS_JSON_FILENAME)
-
-
-@app.get("/fmap/description/{job_id}")
-def description(job_id: str):
-    """Return description.txt for a completed job."""
-    meta = JOBS.get(job_id)
-    if not meta:
-        raise HTTPException(status_code=404, detail="Unknown job_id")
-    job_dir = meta.get("job_dir") or _job_dir(job_id)
-    p = os.path.join(job_dir, DESCRIPTION_FILENAME)
-    if not os.path.exists(p):
-        raise HTTPException(status_code=404, detail="description.txt not found for this job")
-    return FileResponse(p, media_type="text/plain; charset=utf-8", filename=DESCRIPTION_FILENAME)
-
 
 
 
@@ -1362,3 +1418,10 @@ def fmap_timeseries(job_id: str, kind: str = "point", freq: str = "daily") -> Re
 
     with open(path, "r", encoding="utf-8") as f:
         return Response(content=f.read(), media_type="application/json")
+
+
+@app.post("/fmap/fireland_candidates")
+def fmap_fireland_candidates(req: FirelandRequest) -> Dict[str, Any]:
+    """Return candidate 'fireland' points inside AOI based on LANDFIRE structure (EVC/EVH)."""
+    return _fireland_candidates(req)
+
