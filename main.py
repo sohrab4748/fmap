@@ -10,11 +10,13 @@ Render Start Command:
 """
 
 import os
+import json
 import time
 import uuid
 import shutil
 import traceback
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, Optional, List, Literal, Tuple
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,12 +27,13 @@ import logging
 import threading
 import io
 import faulthandler
-from pathlib import Path
+
 from fmap_download import run_download_pipeline, ncss_point_csv, GRIDMET_DATASETS, spi_gamma_monthly
 from fmap_analysis import run_analysis, build_manifest
 
 APP_VERSION = "0.1.1"
-JOB_ROOT = os.getenv("FMAP_JOB_ROOT", "/tmp/fmap_jobs")
+DEFAULT_JOB_ROOT = str(Path(__file__).with_name("_fmap_jobs"))
+JOB_ROOT = os.getenv("FMAP_JOB_ROOT", DEFAULT_JOB_ROOT)
 MAX_JOB_AGE_SECONDS = int(os.getenv("FMAP_MAX_JOB_AGE_SECONDS", "86400"))  # 24h
 
 # Guardrails for Render temporary storage (free instances are typically evicted around ~2GB).
@@ -83,295 +86,6 @@ _logger = logging.getLogger("fmap")
 # If set, callers must send header: X-DEBUG-KEY: <value>
 DEBUG_KEY = os.getenv("FMAP_DEBUG_KEY", "").strip()
 
-# ----------------------------
-# Optional: Google Earth Engine (LANDFIRE summaries)
-# ----------------------------
-# Enable by setting: FMAP_ENABLE_EE=1 and providing a service account key.
-# Required env vars:
-#   EE_SERVICE_ACCOUNT=<service account email>
-#   EE_PRIVATE_KEY_JSON=<full JSON key contents>  OR  EE_PRIVATE_KEY_JSON_B64=<base64 of JSON key>
-#
-# LANDFIRE datasets (Earth Engine):
-#   EVT: ee.ImageCollection("LANDFIRE/Vegetation/EVT/v1_4_0")  band: EVT  (30 m)
-#   EVC: ee.ImageCollection("LANDFIRE/Vegetation/EVC/v1_4_0")  band: EVC  (30 m)
-#   EVH: ee.ImageCollection("LANDFIRE/Vegetation/EVH/v1_4_0")  band: EVH  (30 m)
-#
-# Reference (band names and product description):
-#   EVT: https://developers.google.com/earth-engine/datasets/catalog/LANDFIRE_Vegetation_EVT_v1_4_0
-#   EVC: https://developers.google.com/earth-engine/datasets/catalog/LANDFIRE_Vegetation_EVC_v1_4_0
-#   EVH: https://developers.google.com/earth-engine/datasets/catalog/LANDFIRE_Vegetation_EVH_v1_4_0
-try:
-    import ee  # type: ignore
-except Exception:
-    ee = None  # type: ignore
-
-EE_ENABLED = os.getenv("FMAP_ENABLE_EE", "0").strip().lower() in ("1", "true", "yes")
-_EE_LOCK = threading.Lock()
-_EE_INIT_DONE = False
-_EE_INIT_ERROR: Optional[str] = None
-
-# Optional EVT lookup CSV (Value -> Description/Name). If not present, UI will show EVT codes.
-# Put the file in the repo root (same folder as main.py) or set FMAP_LANDFIRE_EVT_CSV to an absolute path.
-LANDFIRE_EVT_CSV = os.getenv("FMAP_LANDFIRE_EVT_CSV", "").strip() or str(Path(__file__).with_name("landfire_evt_lookup.csv"))
-_LANDFIRE_EVT_LOOKUP: Optional[Dict[int, str]] = None
-
-
-def _ee_init_if_needed() -> None:
-    """Initialize Earth Engine once per process (service-account auth)."""
-    global _EE_INIT_DONE, _EE_INIT_ERROR
-    if _EE_INIT_DONE:
-        return
-    with _EE_LOCK:
-        if _EE_INIT_DONE:
-            return
-        if not EE_ENABLED:
-            _EE_INIT_ERROR = "FMAP_ENABLE_EE is not enabled"
-            _EE_INIT_DONE = True
-            return
-        if ee is None:
-            _EE_INIT_ERROR = "earthengine-api is not installed"
-            _EE_INIT_DONE = True
-            return
-
-        sa = os.getenv("EE_SERVICE_ACCOUNT", "").strip()
-        key_json = os.getenv("EE_PRIVATE_KEY_JSON", "").strip()
-        key_b64 = os.getenv("EE_PRIVATE_KEY_JSON_B64", "").strip()
-        if not sa or (not key_json and not key_b64):
-            _EE_INIT_ERROR = "Missing EE_SERVICE_ACCOUNT and/or EE_PRIVATE_KEY_JSON(_B64)"
-            _EE_INIT_DONE = True
-            return
-
-        try:
-            if key_b64 and not key_json:
-                key_json = base64.b64decode(key_b64.encode("utf-8")).decode("utf-8")
-
-            # Write key to a private file under JOB_ROOT (safe on Render; file only in container)
-            key_path = Path(JOB_ROOT) / "_ee_service_key.json"
-            key_path.write_text(key_json, encoding="utf-8")
-
-            creds = ee.ServiceAccountCredentials(sa, str(key_path))
-            ee.Initialize(credentials=creds)
-            _EE_INIT_ERROR = None
-        except Exception as e:
-            _EE_INIT_ERROR = f"EE init failed: {type(e).__name__}: {e}"
-        finally:
-            _EE_INIT_DONE = True
-
-
-def _landfire_evt_lookup_load() -> Dict[int, str]:
-    """Load EVT lookup CSV if present. Expected columns include 'Value' and 'Description' (or similar)."""
-    global _LANDFIRE_EVT_LOOKUP
-    if _LANDFIRE_EVT_LOOKUP is not None:
-        return _LANDFIRE_EVT_LOOKUP
-
-    lookup: Dict[int, str] = {}
-    try:
-        p = Path(LANDFIRE_EVT_CSV)
-        if p.exists():
-            import csv
-            with p.open("r", encoding="utf-8", newline="") as f:
-                reader = csv.DictReader(f)
-                # Accept common column names from LANDFIRE tables
-                for row in reader:
-                    v = row.get("Value") or row.get("VALUE") or row.get("value")
-                    d = row.get("Description") or row.get("DESCRIPTION") or row.get("EVT_NAME") or row.get("EVT_Desc") or row.get("Label") or row.get("label")
-                    if v is None or d is None:
-                        continue
-                    try:
-                        code = int(float(v))
-                    except Exception:
-                        continue
-                    name = str(d).strip()
-                    if name:
-                        lookup[code] = name
-    except Exception:
-        lookup = {}
-
-    _LANDFIRE_EVT_LOOKUP = lookup
-    return lookup
-
-
-def _ee_geom_from_bbox(minlon: float, minlat: float, maxlon: float, maxlat: float):
-    return ee.Geometry.Rectangle([minlon, minlat, maxlon, maxlat], proj=None, geodesic=False)
-
-
-def _ee_landfire_summary(minlon: float, minlat: float, maxlon: float, maxlat: float, pt_lon: float, pt_lat: float) -> Dict[str, Any]:
-    """Return LANDFIRE EVT/EVC/EVH point + bbox summary (small JSON)."""
-    _ee_init_if_needed()
-    if _EE_INIT_ERROR or (ee is None):
-        return {"available": False, "reason": _EE_INIT_ERROR or "EE not available"}
-
-    try:
-        geom = _ee_geom_from_bbox(minlon, minlat, maxlon, maxlat)
-        pt = ee.Geometry.Point([pt_lon, pt_lat])
-
-        # Datasets and bands (documented in EE catalog)
-        evt_img = ee.ImageCollection("LANDFIRE/Vegetation/EVT/v1_4_0").mosaic().select("EVT")
-        evc_img = ee.ImageCollection("LANDFIRE/Vegetation/EVC/v1_4_0").mosaic().select("EVC")
-        evh_img = ee.ImageCollection("LANDFIRE/Vegetation/EVH/v1_4_0").mosaic().select("EVH")
-
-        scale = 30
-
-        # Point values
-        evt_point = evt_img.reduceRegion(reducer=ee.Reducer.first(), geometry=pt, scale=scale, maxPixels=1e7).get("EVT")
-        evc_point = evc_img.reduceRegion(reducer=ee.Reducer.first(), geometry=pt, scale=scale, maxPixels=1e7).get("EVC")
-        evh_point = evh_img.reduceRegion(reducer=ee.Reducer.first(), geometry=pt, scale=scale, maxPixels=1e7).get("EVH")
-
-        # EVT histogram over bbox
-        evt_hist = evt_img.reduceRegion(reducer=ee.Reducer.frequencyHistogram(), geometry=geom, scale=scale, maxPixels=1e9).get("EVT")
-
-        # Percentiles for EVC/EVH over bbox (min/p10/p50/mean/p90/max)
-        red = ee.Reducer.minMax().combine(ee.Reducer.mean(), "", True).combine(ee.Reducer.percentile([10, 50, 90]), "", True)
-        evc_stats = evc_img.reduceRegion(reducer=red, geometry=geom, scale=scale, maxPixels=1e9)
-        evh_stats = evh_img.reduceRegion(reducer=red, geometry=geom, scale=scale, maxPixels=1e9)
-
-        # Convert server objects to client JSON
-        evt_point_v = ee.Number(evt_point).getInfo() if evt_point is not None else None
-        evc_point_v = ee.Number(evc_point).getInfo() if evc_point is not None else None
-        evh_point_v = ee.Number(evh_point).getInfo() if evh_point is not None else None
-        evt_hist_d = ee.Dictionary(evt_hist).getInfo() if evt_hist is not None else {}
-
-        evc_d = evc_stats.getInfo() if evc_stats is not None else {}
-        evh_d = evh_stats.getInfo() if evh_stats is not None else {}
-
-        def _pack_stats(d: Dict[str, Any], band: str) -> Dict[str, Any]:
-            # keys like EVC_min, EVC_max, EVC_mean, EVC_p10, EVC_p50, EVC_p90
-            out = {
-                "min": d.get(f"{band}_min"),
-                "p10": d.get(f"{band}_p10"),
-                "p50": d.get(f"{band}_p50"),
-                "mean": d.get(f"{band}_mean"),
-                "p90": d.get(f"{band}_p90"),
-                "max": d.get(f"{band}_max"),
-            }
-            return out
-
-        # Convert histogram to top-k list (by count)
-        hist_items = []
-        total = 0
-        for k, v in (evt_hist_d or {}).items():
-            try:
-                code = int(float(k))
-                cnt = int(v)
-            except Exception:
-                continue
-            total += cnt
-            hist_items.append((code, cnt))
-        hist_items.sort(key=lambda t: t[1], reverse=True)
-        lookup = _landfire_evt_lookup_load()
-        top = []
-        for code, cnt in hist_items[:25]:
-            top.append({
-                "code": code,
-                "name": lookup.get(code),
-                "count": cnt,
-                "pct": (100.0 * cnt / total) if total else None,
-            })
-
-        out = {
-            "available": True,
-            "source": "LANDFIRE v1.4.0 (GEE)",
-            "scale_m": scale,
-            "evt_point": {"code": int(evt_point_v) if evt_point_v is not None else None, "name": lookup.get(int(evt_point_v)) if evt_point_v is not None else None},
-            "evc_point_pct": evc_point_v,
-            "evh_point_m": evh_point_v,
-            "evt_top_bbox": top,
-            "evc_bbox_pct": _pack_stats(evc_d, "EVC"),
-            "evh_bbox_m": _pack_stats(evh_d, "EVH"),
-        }
-        return out
-    except Exception as e:
-        return {"available": False, "reason": f"LANDFIRE summary failed: {type(e).__name__}: {e}"}
-
-
-class FirelandRequest(BaseModel):
-    geojson: Dict[str, Any] = Field(..., description="GeoJSON geometry or Feature/FeatureCollection")
-    n_samples: int = Field(500, ge=50, le=5000)
-    seed: int = 0
-    min_evc: float = Field(30.0, ge=0.0, le=100.0, description="Min canopy cover (%)")
-    min_evh: float = Field(2.0, ge=0.0, le=100.0, description="Min vegetation height (m)")
-    top_k: int = Field(200, ge=10, le=2000)
-
-
-def _geojson_to_geometry(gj: Dict[str, Any]):
-    # Accept Geometry, Feature, FeatureCollection (use first feature)
-    if not isinstance(gj, dict):
-        raise ValueError("geojson must be an object")
-    if gj.get("type") == "FeatureCollection":
-        feats = gj.get("features") or []
-        if not feats:
-            raise ValueError("FeatureCollection has no features")
-        gj = feats[0]
-    if gj.get("type") == "Feature":
-        geom = gj.get("geometry")
-        if not geom:
-            raise ValueError("Feature has no geometry")
-        gj = geom
-    if "type" not in gj or "coordinates" not in gj:
-        raise ValueError("Invalid GeoJSON geometry")
-    return ee.Geometry(gj)
-
-
-def _fireland_candidates(req: FirelandRequest) -> Dict[str, Any]:
-    """Sample candidate points inside AOI and rank by a simple LANDFIRE fuel-structure score."""
-    _ee_init_if_needed()
-    if _EE_INIT_ERROR or (ee is None):
-        return {"available": False, "reason": _EE_INIT_ERROR or "EE not available"}
-
-    geom = _geojson_to_geometry(req.geojson)
-    scale = 30
-
-    evt_img = ee.ImageCollection("LANDFIRE/Vegetation/EVT/v1_4_0").mosaic().select("EVT")
-    evc_img = ee.ImageCollection("LANDFIRE/Vegetation/EVC/v1_4_0").mosaic().select("EVC")
-    evh_img = ee.ImageCollection("LANDFIRE/Vegetation/EVH/v1_4_0").mosaic().select("EVH")
-
-    img = evt_img.addBands(evc_img).addBands(evh_img)
-
-    # Random points
-    pts = ee.FeatureCollection.randomPoints(region=geom, points=req.n_samples, seed=req.seed, maxError=1)
-    samples = img.sampleRegions(collection=pts, scale=scale, geometries=True)
-
-    # Pull back to client (limit)
-    fc = samples.limit(int(req.top_k)).getInfo()
-    feats = fc.get("features", []) if isinstance(fc, dict) else []
-
-    # Rank in python for transparency (score = 0.6*EVC + 0.4*min(EVH/30,1)*100)
-    out_feats = []
-    lookup = _landfire_evt_lookup_load()
-    for f in feats:
-        props = f.get("properties", {}) or {}
-        geomj = f.get("geometry", {}) or {}
-        try:
-            evc = float(props.get("EVC")) if props.get("EVC") is not None else None
-            evh = float(props.get("EVH")) if props.get("EVH") is not None else None
-            evt = int(float(props.get("EVT"))) if props.get("EVT") is not None else None
-        except Exception:
-            continue
-        if evc is None or evh is None:
-            continue
-        if evc < req.min_evc or evh < req.min_evh:
-            continue
-        score = 0.6 * (evc / 100.0) + 0.4 * min(evh / 30.0, 1.0)
-        out_feats.append({
-            "type": "Feature",
-            "geometry": geomj,
-            "properties": {
-                "score": round(score, 4),
-                "evc_pct": evc,
-                "evh_m": evh,
-                "evt_code": evt,
-                "evt_name": lookup.get(evt),
-            }
-        })
-
-    out_feats.sort(key=lambda f: f["properties"]["score"], reverse=True)
-    return {
-        "available": True,
-        "scale_m": scale,
-        "n_returned": min(len(out_feats), req.top_k),
-        "features": out_feats[: req.top_k],
-    }
-
 
 def _require_debug_key(req: Request) -> None:
     if not DEBUG_KEY:
@@ -395,7 +109,7 @@ def _append_job_log(job_dir: str, line: str) -> None:
 
 
 def _job_event(job_id: str, stage: str, message: str = "", **extra: Any) -> None:
-    meta = JOBS.get(job_id)
+    meta = _get_job_meta(job_id)
     job_dir = _job_dir(job_id)
     ts = _utc_now()
 
@@ -410,6 +124,7 @@ def _job_event(job_id: str, stage: str, message: str = "", **extra: Any) -> None
     line = f"{ts} [{job_id}] [{stage}] {message}".rstrip()
     _logger.info(line)
     _append_job_log(job_dir, line)
+    _write_state(job_id)
 
 
 def _start_heartbeat(job_id: str, interval_seconds: int = 30) -> threading.Event:
@@ -417,7 +132,7 @@ def _start_heartbeat(job_id: str, interval_seconds: int = 30) -> threading.Event
 
     def _beat():
         while not stop.wait(interval_seconds):
-            meta = JOBS.get(job_id)
+            meta = _get_job_meta(job_id)
             if not meta:
                 return
             if meta.get("status") in ("done", "error"):
@@ -496,6 +211,49 @@ def _utc_now() -> str:
 
 def _job_dir(job_id: str) -> str:
     return os.path.join(JOB_ROOT, job_id)
+
+
+# --- Job state persistence (survive Render restarts) ---
+STATE_FILENAME = "state.json"
+
+def _state_path(job_id: str) -> str:
+    return os.path.join(_job_dir(job_id), STATE_FILENAME)
+
+def _write_state(job_id: str) -> None:
+    """Best-effort persist JOBS[job_id] to job_dir/state.json."""
+    try:
+        meta = _get_job_meta(job_id)
+        if not meta:
+            return
+        job_dir = _job_dir(job_id)
+        os.makedirs(job_dir, exist_ok=True)
+        tmp = os.path.join(job_dir, STATE_FILENAME + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, _state_path(job_id))
+    except Exception:
+        pass
+
+def _load_state(job_id: str):
+    """Load job meta from job_dir/state.json (returns dict or None)."""
+    try:
+        p = _state_path(job_id)
+        if not os.path.exists(p):
+            return None
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def _get_job_meta(job_id: str):
+    """Get job meta from memory or disk; repopulate JOBS if needed."""
+    meta = _get_job_meta(job_id)
+    if meta:
+        return meta
+    meta = _load_state(job_id)
+    if meta:
+        JOBS[job_id] = meta
+    return meta
 
 
 def _dir_size_bytes(path: str) -> int:
@@ -763,29 +521,6 @@ def _run_job(job_id: str, req: RunRequest) -> None:
         analysis = run_analysis(job_dir=job_dir, request=req.model_dump(), download_meta=download_meta)
         _job_event(job_id, "analysis:done", "Analysis finished")
 
-        # Optional: LANDFIRE (EVT/EVC/EVH) summaries via Google Earth Engine (adds forestry context)
-        try:
-            lf = _ee_landfire_summary(
-                minlon=req.minlon,
-                minlat=req.minlat,
-                maxlon=req.maxlon,
-                maxlat=req.maxlat,
-                pt_lon=req.pt_lon,
-                pt_lat=req.pt_lat,
-            )
-            if isinstance(analysis, dict):
-                analysis["landfire"] = lf
-            # Persist updated analysis to a file for ZIP/links
-            try:
-                ap = os.path.join(job_dir, "analysis_result.json")
-                with open(ap, "w", encoding="utf-8") as f:
-                    json.dump(analysis, f, ensure_ascii=False, indent=2)
-            except Exception:
-                pass
-        except Exception as e:
-            if isinstance(analysis, dict):
-                analysis["landfire"] = {"available": False, "reason": f"LANDFIRE integration failed: {e}"}
-
         # --- Optional time-series products (point and/or region) ---
         ts_warnings: List[str] = []
         try:
@@ -885,6 +620,8 @@ def _run_job(job_id: str, req: RunRequest) -> None:
         except Exception:
             pass
 
+        _write_state(job_id)
+
 
 @app.get("/health")
 def health():
@@ -944,7 +681,7 @@ def run_sync(req: RunRequest):
     }
     _run_job(job_id, req)
 
-    meta = JOBS.get(job_id)
+    meta = _get_job_meta(job_id)
     if not meta:
         raise HTTPException(status_code=500, detail="Job missing")
 
@@ -965,7 +702,7 @@ def run_sync(req: RunRequest):
 
 @app.get("/fmap/status/{job_id}", response_model=StatusResponse)
 def status(job_id: str):
-    meta = JOBS.get(job_id)
+    meta = _get_job_meta(job_id)
     if not meta:
         raise HTTPException(status_code=404, detail="Unknown job_id")
     elapsed = None
@@ -989,7 +726,7 @@ def status(job_id: str):
 
 @app.get("/fmap/result/{job_id}", response_model=ResultResponse)
 def result(job_id: str):
-    meta = JOBS.get(job_id)
+    meta = _get_job_meta(job_id)
     if not meta:
         raise HTTPException(status_code=404, detail="Unknown job_id")
 
@@ -1013,7 +750,7 @@ def result(job_id: str):
 
 @app.get("/fmap/download/{job_id}")
 def download(job_id: str):
-    meta = JOBS.get(job_id)
+    meta = _get_job_meta(job_id)
     if not meta:
         raise HTTPException(status_code=404, detail="Unknown job_id")
 
@@ -1030,7 +767,7 @@ def download(job_id: str):
 def debug_job(job_id: str, req: Request, tail: int = 200) -> Dict[str, Any]:
     """Lightweight debug endpoint: returns job meta + tail of per-job log."""
     _require_debug_key(req)
-    meta = JOBS.get(job_id)
+    meta = _get_job_meta(job_id)
     if not meta:
         raise HTTPException(status_code=404, detail="Unknown job_id")
 
@@ -1049,7 +786,7 @@ def debug_stack(job_id: str, req: Request, max_chars: int = 60000) -> Dict[str, 
     Security: if FMAP_DEBUG_KEY is set, callers must provide X-DEBUG-KEY.
     """
     _require_debug_key(req)
-    meta = JOBS.get(job_id)
+    meta = _get_job_meta(job_id)
     if not meta:
         raise HTTPException(status_code=404, detail="Unknown job_id")
 
@@ -1418,10 +1155,3 @@ def fmap_timeseries(job_id: str, kind: str = "point", freq: str = "daily") -> Re
 
     with open(path, "r", encoding="utf-8") as f:
         return Response(content=f.read(), media_type="application/json")
-
-
-@app.post("/fmap/fireland_candidates")
-def fmap_fireland_candidates(req: FirelandRequest) -> Dict[str, Any]:
-    """Return candidate 'fireland' points inside AOI based on LANDFIRE structure (EVC/EVH)."""
-    return _fireland_candidates(req)
-
