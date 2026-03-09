@@ -86,6 +86,21 @@ _logger = logging.getLogger("fmap")
 # If set, callers must send header: X-DEBUG-KEY: <value>
 DEBUG_KEY = os.getenv("FMAP_DEBUG_KEY", "").strip()
 
+LANDFIRE_FOLDER = os.getenv("FMAP_LANDFIRE_FOLDER", "Landfire_LF240").strip() or "Landfire_LF240"
+LANDFIRE_EVT_URL = os.getenv(
+    "FMAP_LANDFIRE_EVT_URL",
+    f"https://lfps.usgs.gov/arcgis/rest/services/{LANDFIRE_FOLDER}/US_240EVT/ImageServer",
+).strip()
+LANDFIRE_EVC_URL = os.getenv(
+    "FMAP_LANDFIRE_EVC_URL",
+    f"https://lfps.usgs.gov/arcgis/rest/services/{LANDFIRE_FOLDER}/US_240EVC/ImageServer",
+).strip()
+LANDFIRE_EVH_URL = os.getenv(
+    "FMAP_LANDFIRE_EVH_URL",
+    f"https://lfps.usgs.gov/arcgis/rest/services/{LANDFIRE_FOLDER}/US_240EVH/ImageServer",
+).strip()
+LANDFIRE_TIMEOUT_SECONDS = int(os.getenv("FMAP_LANDFIRE_TIMEOUT_SECONDS", "90"))
+
 
 def _require_debug_key(req: Request) -> None:
     if not DEBUG_KEY:
@@ -449,6 +464,15 @@ class ResultResponse(BaseModel):
     download_url: Optional[str] = None
 
 
+class FirelandRequest(BaseModel):
+    geojson: Dict[str, Any]
+    n_samples: int = Field(800, ge=10, le=10000)
+    seed: int = Field(0, ge=0, le=999999999)
+    min_evc: float = Field(30.0, ge=0.0, le=100.0)
+    min_evh: float = Field(2.0, ge=0.0, le=200.0)
+    top_k: int = Field(200, ge=1, le=2000)
+
+
 def _run_job(job_id: str, req: RunRequest) -> None:
     job_dir = _job_dir(job_id)
     os.makedirs(job_dir, exist_ok=True)
@@ -519,6 +543,12 @@ def _run_job(job_id: str, req: RunRequest) -> None:
 
         _job_event(job_id, "analysis:start", "Starting analysis")
         analysis = run_analysis(job_dir=job_dir, request=req.model_dump(), download_meta=download_meta)
+        try:
+            if isinstance(analysis, dict):
+                analysis["landfire"] = _build_landfire_summary(job_dir=job_dir, req=req)
+        except Exception as _landfire_e:
+            if isinstance(analysis, dict):
+                analysis["landfire"] = {"available": False, "reason": f"{type(_landfire_e).__name__}: {_landfire_e}"}
         _job_event(job_id, "analysis:done", "Analysis finished")
 
         # --- Optional time-series products (point and/or region) ---
@@ -746,84 +776,6 @@ def result(job_id: str):
         manifest=meta["manifest"],
         download_url=download_url,
     )
-
-
-@app.get("/fmap/analysis_result/{job_id}")
-def analysis_result(job_id: str):
-    meta = _get_job_meta(job_id)
-    if not meta:
-        raise HTTPException(status_code=404, detail="Unknown job_id")
-
-    if meta.get("status") in ("queued", "running"):
-        raise HTTPException(status_code=409, detail={"status": meta.get("status"), "message": "Not finished yet. Use /fmap/status."})
-
-    if meta.get("status") == "error":
-        raise HTTPException(status_code=500, detail={"error": meta.get("error"), "traceback": meta.get("traceback")})
-
-    return meta.get("analysis", {})
-
-
-@app.get("/fmap/description/{job_id}")
-def description(job_id: str):
-    meta = _get_job_meta(job_id)
-    if not meta:
-        raise HTTPException(status_code=404, detail="Unknown job_id")
-
-    if meta.get("status") in ("queued", "running"):
-        raise HTTPException(status_code=409, detail={"status": meta.get("status"), "message": "Not finished yet. Use /fmap/status."})
-
-    if meta.get("status") == "error":
-        raise HTTPException(status_code=500, detail={"error": meta.get("error"), "traceback": meta.get("traceback")})
-
-    analysis = meta.get("analysis", {}) or {}
-    manifest = meta.get("manifest", {}) or {}
-    lines = [
-        f"FMAP-AI job: {job_id}",
-        f"Status: {meta.get('status', 'unknown')}",
-        f"Started at: {meta.get('started_at', '')}",
-        f"Finished at: {meta.get('finished_at', '')}",
-        "",
-        "Summary:",
-    ]
-
-    try:
-        landcover = analysis.get("landcover", {}) or {}
-        vegetation = analysis.get("vegetation", {}) or {}
-        climate = analysis.get("climate", {}) or {}
-        spi30 = analysis.get("spi30", {}) or {}
-        disturbance = analysis.get("disturbance", {}) or {}
-        biomass_carbon = analysis.get("biomass_carbon", {}) or {}
-
-        if landcover.get("nlcd_label_point"):
-            lines.append(f"- Landcover (NLCD): {landcover['nlcd_label_point']}")
-        if vegetation.get("ndvi", {}).get("point") is not None:
-            lines.append(f"- NDVI at point: {vegetation['ndvi']['point']}")
-        if climate.get("pr_total_mm") is not None:
-            lines.append(f"- Precipitation total (mm): {climate['pr_total_mm']}")
-        if spi30.get("last") is not None:
-            lines.append(f"- SPI-30 last: {spi30['last']}")
-        agb = (biomass_carbon.get("agb", {}) or {}).get("point_MgHa")
-        if agb is not None:
-            lines.append(f"- AGB at point (Mg/ha): {agb}")
-        agc = (biomass_carbon.get("agc", {}) or {}).get("point_MgHa")
-        if agc is not None:
-            lines.append(f"- AGC at point (Mg/ha): {agc}")
-        burned = disturbance.get("burned_area_total_km2")
-        if burned is not None:
-            lines.append(f"- Burned area in bbox (km²): {burned}")
-    except Exception:
-        lines.append("- Analysis summary could not be generated.")
-
-    files = manifest.get("files", [])
-    lines.extend(["", f"Manifest files: {len(files)}"])
-    for item in files[:50]:
-        if isinstance(item, dict):
-            lines.append(f"- {item.get('path') or item.get('name') or str(item)}")
-        else:
-            lines.append(f"- {item}")
-
-    text = "\n".join(lines)
-    return Response(content=text, media_type="text/plain; charset=utf-8")
 
 
 @app.get("/fmap/download/{job_id}")
@@ -1215,6 +1167,337 @@ def _compute_region_mean_timeseries(job_dir: str, req: RunRequest) -> None:
         spi_df["time"] = pd.to_datetime(spi_df["time"], utc=True).dt.tz_convert(None)
         out_spi = os.path.join(job_dir, "spi30_region.csv")
         spi_df.to_csv(out_spi, index=False)
+
+
+def _landfire_request_session():
+    import requests
+    s = requests.Session()
+    s.headers.update({"User-Agent": f"FMAP-AI/{APP_VERSION}"})
+    return s
+
+
+def _landfire_parse_geometry(geojson: Dict[str, Any]):
+    from shapely.geometry import shape
+    from shapely.ops import unary_union
+
+    if not isinstance(geojson, dict):
+        raise ValueError("geojson must be an object")
+
+    gtype = geojson.get("type")
+    if gtype == "FeatureCollection":
+        geoms = []
+        for feat in geojson.get("features", []) or []:
+            if isinstance(feat, dict) and feat.get("geometry"):
+                geoms.append(shape(feat["geometry"]))
+        if not geoms:
+            raise ValueError("GeoJSON FeatureCollection has no geometries")
+        geom = unary_union(geoms)
+    elif gtype == "Feature":
+        geom = shape(geojson.get("geometry"))
+    else:
+        geom = shape(geojson)
+
+    if geom.is_empty:
+        raise ValueError("GeoJSON geometry is empty")
+    return geom
+
+
+def _landfire_bbox_to_size(bbox: Tuple[float, float, float, float], pixel_size_m: float = 30.0, max_dim: int = 1400) -> Tuple[int, int]:
+    import math
+    w, s, e, n = bbox
+    mid_lat = (s + n) / 2.0
+    width_m = max(1.0, abs(e - w) * 111320.0 * max(0.05, math.cos(math.radians(mid_lat))))
+    height_m = max(1.0, abs(n - s) * 111320.0)
+    width_px = max(64, min(max_dim, int(round(width_m / pixel_size_m))))
+    height_px = max(64, min(max_dim, int(round(height_m / pixel_size_m))))
+    return width_px, height_px
+
+
+def _landfire_fetch_json(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    sess = _landfire_request_session()
+    r = sess.get(url, params=params, timeout=LANDFIRE_TIMEOUT_SECONDS)
+    r.raise_for_status()
+    js = r.json()
+    if isinstance(js, dict) and js.get("error"):
+        raise RuntimeError(str(js["error"]))
+    return js
+
+
+def _landfire_export_tiff(image_server_url: str, bbox: Tuple[float, float, float, float], out_path: str, width: int, height: int) -> str:
+    import requests
+
+    params = {
+        "bbox": f"{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}",
+        "bboxSR": 4326,
+        "imageSR": 4326,
+        "size": f"{int(width)},{int(height)}",
+        "format": "tiff",
+        "interpolation": "RSP_NearestNeighbor",
+        "f": "json",
+    }
+    js = _landfire_fetch_json(image_server_url + "/exportImage", params)
+    href = js.get("href") or js.get("imageHref") or ((js.get("imageData") or {}).get("href") if isinstance(js.get("imageData"), dict) else None)
+    if not href:
+        raise RuntimeError(f"LANDFIRE exportImage did not return href for {image_server_url}")
+
+    with requests.get(href, stream=True, timeout=LANDFIRE_TIMEOUT_SECONDS) as r:
+        r.raise_for_status()
+        with open(out_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 256):
+                if chunk:
+                    f.write(chunk)
+    return out_path
+
+
+def _landfire_load_legend(image_server_url: str) -> Dict[int, str]:
+    js = _landfire_fetch_json(image_server_url + "/legend", {"f": "json"})
+    out: Dict[int, str] = {}
+    if isinstance(js, dict):
+        layers = js.get("layers")
+        if isinstance(layers, list):
+            for lyr in layers:
+                for item in lyr.get("legend", []) or []:
+                    try:
+                        val = item.get("value")
+                        if val is None:
+                            continue
+                        out[int(val)] = str(item.get("label") or item.get("labelText") or item.get("name") or val)
+                    except Exception:
+                        continue
+        for item in js.get("legend", []) or []:
+            try:
+                val = item.get("value")
+                if val is None:
+                    continue
+                out[int(val)] = str(item.get("label") or item.get("labelText") or item.get("name") or val)
+            except Exception:
+                continue
+    return out
+
+
+def _landfire_value_name(code: Optional[int], legend_map: Dict[int, str]) -> Optional[str]:
+    if code is None:
+        return None
+    return legend_map.get(int(code)) or legend_map.get(int(float(code))) if legend_map else None
+
+
+def _landfire_point_sample(ds, lon: float, lat: float) -> Optional[float]:
+    try:
+        row, col = ds.index(lon, lat)
+        if row < 0 or col < 0 or row >= ds.height or col >= ds.width:
+            return None
+        arr = ds.read(1, masked=True)
+        val = arr[row, col]
+        if getattr(val, "mask", False):
+            return None
+        return float(val)
+    except Exception:
+        return None
+
+
+def _landfire_numeric_stats(values) -> Optional[Dict[str, float]]:
+    import numpy as np
+    arr = np.asarray(values, dtype=float)
+    if arr.size == 0:
+        return None
+    return {
+        "min": float(np.min(arr)),
+        "p10": float(np.quantile(arr, 0.10)),
+        "mean": float(np.mean(arr)),
+        "median": float(np.quantile(arr, 0.50)),
+        "p90": float(np.quantile(arr, 0.90)),
+        "max": float(np.max(arr)),
+    }
+
+
+def _build_landfire_from_rasters(evt_path: str, evc_path: str, evh_path: str, geom, pt_lon: Optional[float] = None, pt_lat: Optional[float] = None, n_samples: int = 800, seed: int = 0, min_evc: float = 30.0, min_evh: float = 2.0, top_k: int = 200) -> Dict[str, Any]:
+    import numpy as np
+    import rasterio
+    from rasterio.features import geometry_mask
+    from rasterio.transform import xy
+
+    evt_legend = _landfire_load_legend(LANDFIRE_EVT_URL)
+
+    with rasterio.open(evt_path) as ds_evt, rasterio.open(evc_path) as ds_evc, rasterio.open(evh_path) as ds_evh:
+        evt = ds_evt.read(1, masked=True)
+        evc = ds_evc.read(1, masked=True)
+        evh = ds_evh.read(1, masked=True)
+        poly_mask = geometry_mask([geom.__geo_interface__], transform=ds_evt.transform, invert=True, out_shape=(ds_evt.height, ds_evt.width))
+        valid = poly_mask & (~np.ma.getmaskarray(evt)) & (~np.ma.getmaskarray(evc)) & (~np.ma.getmaskarray(evh))
+
+        evt_vals = np.asarray(evt[valid]).astype(float)
+        evc_vals = np.asarray(evc[valid]).astype(float)
+        evh_vals = np.asarray(evh[valid]).astype(float)
+
+        out: Dict[str, Any] = {"available": True}
+
+        point_evt = point_evc = point_evh = None
+        if pt_lon is not None and pt_lat is not None:
+            point_evt = _landfire_point_sample(ds_evt, pt_lon, pt_lat)
+            point_evc = _landfire_point_sample(ds_evc, pt_lon, pt_lat)
+            point_evh = _landfire_point_sample(ds_evh, pt_lon, pt_lat)
+
+        out["evt"] = {
+            "point_value": None if point_evt is None else int(round(point_evt)),
+            "point_name": None if point_evt is None else _landfire_value_name(int(round(point_evt)), evt_legend),
+            "top_classes": [],
+            "total_pixels": int(evt_vals.size),
+        }
+        out["evc"] = {
+            "point_value": None if point_evc is None else float(point_evc),
+            "stats": _landfire_numeric_stats(evc_vals),
+        }
+        out["evh"] = {
+            "point_value": None if point_evh is None else float(point_evh),
+            "stats": _landfire_numeric_stats(evh_vals),
+        }
+
+        if evt_vals.size:
+            unique, counts = np.unique(evt_vals.astype(int), return_counts=True)
+            rows = []
+            total = int(counts.sum()) if counts.size else 0
+            for code, cnt in zip(unique.tolist(), counts.tolist()):
+                rows.append({
+                    "code": int(code),
+                    "name": _landfire_value_name(int(code), evt_legend),
+                    "count": int(cnt),
+                    "fraction": float(cnt / total) if total else None,
+                })
+            rows.sort(key=lambda r: r["count"], reverse=True)
+            out["evt"]["top_classes"] = rows[:10]
+
+        cand_mask = valid.copy()
+        cand_mask &= np.asarray(evc.filled(-9999) >= float(min_evc))
+        cand_mask &= np.asarray(evh.filled(-9999) >= float(min_evh))
+        rc = np.argwhere(cand_mask)
+        features: List[Dict[str, Any]] = []
+        if rc.size:
+            rng = np.random.default_rng(int(seed))
+            if len(rc) > int(n_samples):
+                rc = rc[rng.choice(len(rc), size=int(n_samples), replace=False)]
+            rows = []
+            for row, col in rc.tolist():
+                x, y = xy(ds_evt.transform, row, col, offset="center")
+                evt_code = int(round(float(evt[row, col])))
+                evc_pct = float(evc[row, col])
+                evh_m = float(evh[row, col])
+                score = float((evc_pct * 1.0) + (evh_m * 5.0))
+                rows.append((score, x, y, evt_code, evc_pct, evh_m))
+            rows.sort(key=lambda t: t[0], reverse=True)
+            for score, x, y, evt_code, evc_pct, evh_m in rows[: int(top_k)]:
+                features.append({
+                    "type": "Feature",
+                    "geometry": {"type": "Point", "coordinates": [float(x), float(y)]},
+                    "properties": {
+                        "score": round(float(score), 3),
+                        "evc_pct": round(float(evc_pct), 3),
+                        "evh_m": round(float(evh_m), 3),
+                        "evt_code": int(evt_code),
+                        "evt_name": _landfire_value_name(evt_code, evt_legend),
+                    },
+                })
+
+        out["candidates"] = {
+            "count": int(len(features)),
+            "features": features,
+            "criteria": {"min_evc": float(min_evc), "min_evh": float(min_evh), "n_samples": int(n_samples), "top_k": int(top_k)},
+        }
+        return out
+
+
+def _build_landfire_summary(job_dir: str, req: RunRequest) -> Dict[str, Any]:
+    geom = None
+    try:
+        geom = _landfire_parse_geometry(req.region_geojson) if getattr(req, "region_geojson", None) else None
+    except Exception:
+        geom = None
+    if geom is None:
+        from shapely.geometry import box
+        geom = box(req.minlon, req.minlat, req.maxlon, req.maxlat)
+
+    bbox = geom.bounds
+    width, height = _landfire_bbox_to_size(bbox, max_dim=min(max(int(getattr(req, "size_px", 900) or 900), 128), 1400))
+    landfire_dir = os.path.join(job_dir, "landfire")
+    os.makedirs(landfire_dir, exist_ok=True)
+    evt_path = os.path.join(landfire_dir, "evt.tif")
+    evc_path = os.path.join(landfire_dir, "evc.tif")
+    evh_path = os.path.join(landfire_dir, "evh.tif")
+
+    if not os.path.exists(evt_path):
+        _landfire_export_tiff(LANDFIRE_EVT_URL, bbox, evt_path, width, height)
+    if not os.path.exists(evc_path):
+        _landfire_export_tiff(LANDFIRE_EVC_URL, bbox, evc_path, width, height)
+    if not os.path.exists(evh_path):
+        _landfire_export_tiff(LANDFIRE_EVH_URL, bbox, evh_path, width, height)
+
+    data = _build_landfire_from_rasters(
+        evt_path=evt_path,
+        evc_path=evc_path,
+        evh_path=evh_path,
+        geom=geom,
+        pt_lon=float(req.pt_lon),
+        pt_lat=float(req.pt_lat),
+        n_samples=800,
+        seed=0,
+        min_evc=30.0,
+        min_evh=2.0,
+        top_k=200,
+    )
+    data["service_folder"] = LANDFIRE_FOLDER
+    data["bbox"] = {"minlon": bbox[0], "minlat": bbox[1], "maxlon": bbox[2], "maxlat": bbox[3]}
+    data["files"] = {"evt": os.path.basename(evt_path), "evc": os.path.basename(evc_path), "evh": os.path.basename(evh_path)}
+    return data
+
+
+@app.post("/fmap/fireland_candidates")
+def fireland_candidates(req: FirelandRequest):
+    try:
+        geom = _landfire_parse_geometry(req.geojson)
+        bbox = geom.bounds
+        width, height = _landfire_bbox_to_size(bbox)
+
+        tmp_root = os.path.join(JOB_ROOT, "_fireland_tmp")
+        os.makedirs(tmp_root, exist_ok=True)
+        work_dir = os.path.join(tmp_root, uuid.uuid4().hex)
+        os.makedirs(work_dir, exist_ok=True)
+        evt_path = os.path.join(work_dir, "evt.tif")
+        evc_path = os.path.join(work_dir, "evc.tif")
+        evh_path = os.path.join(work_dir, "evh.tif")
+
+        _landfire_export_tiff(LANDFIRE_EVT_URL, bbox, evt_path, width, height)
+        _landfire_export_tiff(LANDFIRE_EVC_URL, bbox, evc_path, width, height)
+        _landfire_export_tiff(LANDFIRE_EVH_URL, bbox, evh_path, width, height)
+
+        result = _build_landfire_from_rasters(
+            evt_path=evt_path,
+            evc_path=evc_path,
+            evh_path=evh_path,
+            geom=geom,
+            pt_lon=None,
+            pt_lat=None,
+            n_samples=req.n_samples,
+            seed=req.seed,
+            min_evc=req.min_evc,
+            min_evh=req.min_evh,
+            top_k=req.top_k,
+        )
+        return {
+            "available": True,
+            "service_folder": LANDFIRE_FOLDER,
+            "bbox": {"minlon": bbox[0], "minlat": bbox[1], "maxlon": bbox[2], "maxlat": bbox[3]},
+            "features": (result.get("candidates") or {}).get("features", []),
+            "evt": result.get("evt"),
+            "evc": result.get("evc"),
+            "evh": result.get("evh"),
+        }
+    except Exception as e:
+        return {"available": False, "reason": f"{type(e).__name__}: {e}"}
+    finally:
+        try:
+            if 'work_dir' in locals() and os.path.exists(work_dir):
+                _safe_rmtree(work_dir)
+        except Exception:
+            pass
 
 
 @app.get("/fmap/timeseries/{job_id}")
