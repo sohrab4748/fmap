@@ -247,7 +247,7 @@ def _load_state(job_id: str):
 
 def _get_job_meta(job_id: str):
     """Get job meta from memory or disk; repopulate JOBS if needed."""
-    meta = _get_job_meta(job_id)
+    meta = JOBS.get(job_id)
     if meta:
         return meta
     meta = _load_state(job_id)
@@ -746,6 +746,84 @@ def result(job_id: str):
         manifest=meta["manifest"],
         download_url=download_url,
     )
+
+
+@app.get("/fmap/analysis_result/{job_id}")
+def analysis_result(job_id: str):
+    meta = _get_job_meta(job_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Unknown job_id")
+
+    if meta.get("status") in ("queued", "running"):
+        raise HTTPException(status_code=409, detail={"status": meta.get("status"), "message": "Not finished yet. Use /fmap/status."})
+
+    if meta.get("status") == "error":
+        raise HTTPException(status_code=500, detail={"error": meta.get("error"), "traceback": meta.get("traceback")})
+
+    return meta.get("analysis", {})
+
+
+@app.get("/fmap/description/{job_id}")
+def description(job_id: str):
+    meta = _get_job_meta(job_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Unknown job_id")
+
+    if meta.get("status") in ("queued", "running"):
+        raise HTTPException(status_code=409, detail={"status": meta.get("status"), "message": "Not finished yet. Use /fmap/status."})
+
+    if meta.get("status") == "error":
+        raise HTTPException(status_code=500, detail={"error": meta.get("error"), "traceback": meta.get("traceback")})
+
+    analysis = meta.get("analysis", {}) or {}
+    manifest = meta.get("manifest", {}) or {}
+    lines = [
+        f"FMAP-AI job: {job_id}",
+        f"Status: {meta.get('status', 'unknown')}",
+        f"Started at: {meta.get('started_at', '')}",
+        f"Finished at: {meta.get('finished_at', '')}",
+        "",
+        "Summary:",
+    ]
+
+    try:
+        landcover = analysis.get("landcover", {}) or {}
+        vegetation = analysis.get("vegetation", {}) or {}
+        climate = analysis.get("climate", {}) or {}
+        spi30 = analysis.get("spi30", {}) or {}
+        disturbance = analysis.get("disturbance", {}) or {}
+        biomass_carbon = analysis.get("biomass_carbon", {}) or {}
+
+        if landcover.get("nlcd_label_point"):
+            lines.append(f"- Landcover (NLCD): {landcover['nlcd_label_point']}")
+        if vegetation.get("ndvi", {}).get("point") is not None:
+            lines.append(f"- NDVI at point: {vegetation['ndvi']['point']}")
+        if climate.get("pr_total_mm") is not None:
+            lines.append(f"- Precipitation total (mm): {climate['pr_total_mm']}")
+        if spi30.get("last") is not None:
+            lines.append(f"- SPI-30 last: {spi30['last']}")
+        agb = (biomass_carbon.get("agb", {}) or {}).get("point_MgHa")
+        if agb is not None:
+            lines.append(f"- AGB at point (Mg/ha): {agb}")
+        agc = (biomass_carbon.get("agc", {}) or {}).get("point_MgHa")
+        if agc is not None:
+            lines.append(f"- AGC at point (Mg/ha): {agc}")
+        burned = disturbance.get("burned_area_total_km2")
+        if burned is not None:
+            lines.append(f"- Burned area in bbox (km²): {burned}")
+    except Exception:
+        lines.append("- Analysis summary could not be generated.")
+
+    files = manifest.get("files", [])
+    lines.extend(["", f"Manifest files: {len(files)}"])
+    for item in files[:50]:
+        if isinstance(item, dict):
+            lines.append(f"- {item.get('path') or item.get('name') or str(item)}")
+        else:
+            lines.append(f"- {item}")
+
+    text = "\n".join(lines)
+    return Response(content=text, media_type="text/plain; charset=utf-8")
 
 
 @app.get("/fmap/download/{job_id}")
