@@ -473,6 +473,89 @@ class FirelandRequest(BaseModel):
     top_k: int = Field(200, ge=1, le=2000)
 
 
+def _build_description_text(job_id: str, meta: Dict[str, Any]) -> str:
+    analysis = meta.get("analysis", {}) or {}
+    manifest = meta.get("manifest", {}) or {}
+    lines = [
+        f"FMAP-AI job: {job_id}",
+        f"Status: {meta.get('status', 'unknown')}",
+        f"Started at: {meta.get('started_at', '')}",
+        f"Finished at: {meta.get('finished_at', '')}",
+        "",
+        "Summary:",
+    ]
+    try:
+        landcover = analysis.get("landcover", {}) or {}
+        vegetation = analysis.get("vegetation", {}) or {}
+        climate = analysis.get("climate", {}) or {}
+        spi30 = analysis.get("spi30", {}) or {}
+        disturbance = analysis.get("disturbance", {}) or {}
+        biomass_carbon = analysis.get("biomass_carbon", {}) or {}
+        landfire = analysis.get("landfire", {}) or {}
+
+        if landcover.get("nlcd_label_point"):
+            lines.append(f"- Landcover (NLCD): {landcover['nlcd_label_point']}")
+        if vegetation.get("ndvi", {}).get("point") is not None:
+            lines.append(f"- NDVI at point: {vegetation['ndvi']['point']}")
+        if climate.get("pr_total_mm") is not None:
+            lines.append(f"- Precipitation total (mm): {climate['pr_total_mm']}")
+        if spi30.get("last") is not None:
+            lines.append(f"- SPI-30 last: {spi30['last']}")
+        agb = (biomass_carbon.get("agb", {}) or {}).get("point_MgHa")
+        if agb is not None:
+            lines.append(f"- AGB at point (Mg/ha): {agb}")
+        agc = (biomass_carbon.get("agc", {}) or {}).get("point_MgHa")
+        if agc is not None:
+            lines.append(f"- AGC at point (Mg/ha): {agc}")
+        burned = disturbance.get("burned_area_total_km2")
+        if burned is not None:
+            lines.append(f"- Burned area in bbox (km²): {burned}")
+        evt = (landfire.get("evt", {}) or {}).get("point_name") or (landfire.get("evt", {}) or {}).get("point_value")
+        if evt is not None:
+            lines.append(f"- LANDFIRE EVT at point: {evt}")
+        evc = (landfire.get("evc", {}) or {}).get("point_value")
+        if evc is not None:
+            lines.append(f"- LANDFIRE EVC at point (%): {evc}")
+        evh = (landfire.get("evh", {}) or {}).get("point_value")
+        if evh is not None:
+            lines.append(f"- LANDFIRE EVH at point (m): {evh}")
+    except Exception:
+        lines.append("- Analysis summary could not be generated.")
+
+    files = manifest.get("files", [])
+    lines.extend(["", f"Manifest files: {len(files)}"])
+    for item in files[:50]:
+        if isinstance(item, dict):
+            lines.append(f"- {item.get('path') or item.get('name') or str(item)}")
+        else:
+            lines.append(f"- {item}")
+    return "\n".join(lines)
+
+
+def _persist_public_outputs(job_dir: str, job_id: str, req: RunRequest, download_meta: Dict[str, Any], analysis: Dict[str, Any], manifest: Optional[Dict[str, Any]] = None, meta: Optional[Dict[str, Any]] = None) -> None:
+    try:
+        os.makedirs(job_dir, exist_ok=True)
+        analysis_path = os.path.join(job_dir, "analysis_result.json")
+        with open(analysis_path, "w", encoding="utf-8") as f:
+            json.dump(analysis, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+    try:
+        desc_path = os.path.join(job_dir, "description.txt")
+        if meta is None:
+            meta = {
+                "status": "done",
+                "started_at": "",
+                "finished_at": _utc_now(),
+                "analysis": analysis,
+                "manifest": manifest or {},
+            }
+        with open(desc_path, "w", encoding="utf-8") as f:
+            f.write(_build_description_text(job_id, meta))
+    except Exception:
+        pass
+
+
 def _run_job(job_id: str, req: RunRequest) -> None:
     job_dir = _job_dir(job_id)
     os.makedirs(job_dir, exist_ok=True)
@@ -582,6 +665,21 @@ def _run_job(job_id: str, req: RunRequest) -> None:
             )
 
         manifest = build_manifest(job_dir)
+        _persist_public_outputs(
+            job_dir=job_dir,
+            job_id=job_id,
+            req=req,
+            download_meta=download_meta,
+            analysis=analysis,
+            manifest=manifest,
+            meta={
+                "status": "done",
+                "started_at": JOBS[job_id].get("started_at"),
+                "finished_at": _utc_now(),
+                "analysis": analysis,
+                "manifest": manifest,
+            },
+        )
 
         # Optionally build zip for user download (zipping duplicates bytes temporarily).
         zip_path = None
@@ -776,6 +874,37 @@ def result(job_id: str):
         manifest=meta["manifest"],
         download_url=download_url,
     )
+
+
+@app.get("/fmap/analysis_result/{job_id}")
+def analysis_result(job_id: str):
+    meta = _get_job_meta(job_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Unknown job_id")
+    if meta.get("status") in ("queued", "running"):
+        raise HTTPException(status_code=409, detail={"status": meta.get("status"), "message": "Not finished yet. Use /fmap/status."})
+    if meta.get("status") == "error":
+        raise HTTPException(status_code=500, detail={"error": meta.get("error"), "traceback": meta.get("traceback")})
+    analysis_path = os.path.join(meta.get("job_dir") or _job_dir(job_id), "analysis_result.json")
+    if os.path.exists(analysis_path):
+        return FileResponse(analysis_path, media_type="application/json", filename="analysis_result.json")
+    return meta.get("analysis", {})
+
+
+@app.get("/fmap/description/{job_id}")
+def description(job_id: str):
+    meta = _get_job_meta(job_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Unknown job_id")
+    if meta.get("status") in ("queued", "running"):
+        raise HTTPException(status_code=409, detail={"status": meta.get("status"), "message": "Not finished yet. Use /fmap/status."})
+    if meta.get("status") == "error":
+        raise HTTPException(status_code=500, detail={"error": meta.get("error"), "traceback": meta.get("traceback")})
+    desc_path = os.path.join(meta.get("job_dir") or _job_dir(job_id), "description.txt")
+    if os.path.exists(desc_path):
+        return FileResponse(desc_path, media_type="text/plain; charset=utf-8", filename="description.txt")
+    text = _build_description_text(job_id, meta)
+    return Response(content=text, media_type="text/plain; charset=utf-8")
 
 
 @app.get("/fmap/download/{job_id}")
