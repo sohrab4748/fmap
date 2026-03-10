@@ -15,5 +15,5 @@ pyproj==3.6.1
 gunicorn
 
 google-genai==1.14.0
-
+shapely==2.0.6
 earthengine-api==1.7.16
