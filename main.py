@@ -31,7 +31,7 @@ import faulthandler
 from fmap_download import run_download_pipeline, ncss_point_csv, GRIDMET_DATASETS, spi_gamma_monthly
 from fmap_analysis import run_analysis, build_manifest
 
-APP_VERSION = "0.1.1"
+APP_VERSION = "0.1.2"
 DEFAULT_JOB_ROOT = str(Path(__file__).with_name("_fmap_jobs"))
 JOB_ROOT = os.getenv("FMAP_JOB_ROOT", DEFAULT_JOB_ROOT)
 MAX_JOB_AGE_SECONDS = int(os.getenv("FMAP_MAX_JOB_AGE_SECONDS", "86400"))  # 24h
@@ -260,12 +260,57 @@ def _load_state(job_id: str):
     except Exception:
         return None
 
+
+def _reconstruct_job_meta(job_id: str):
+    """Best-effort recovery when state.json is missing but public outputs still exist."""
+    try:
+        job_dir = _job_dir(job_id)
+        if not os.path.isdir(job_dir):
+            return None
+        analysis_path = os.path.join(job_dir, "analysis_result.json")
+        desc_path = os.path.join(job_dir, "description.txt")
+        zip_path_inside = os.path.join(job_dir, f"{job_id}_outputs.zip")
+        zip_path_root = os.path.join(JOB_ROOT, f"{job_id}_outputs.zip")
+        zip_path = zip_path_root if os.path.exists(zip_path_root) else (zip_path_inside if os.path.exists(zip_path_inside) else None)
+        if not (os.path.exists(analysis_path) or os.path.exists(desc_path) or zip_path):
+            return None
+        analysis = None
+        manifest = None
+        try:
+            if os.path.exists(analysis_path):
+                with open(analysis_path, "r", encoding="utf-8") as f:
+                    analysis = json.load(f)
+        except Exception:
+            analysis = None
+        try:
+            manifest = build_manifest(job_dir)
+        except Exception:
+            manifest = None
+        ts = _utc_now()
+        return {
+            "status": "done",
+            "started_at": ts,
+            "finished_at": ts,
+            "job_dir": job_dir,
+            "analysis": analysis,
+            "manifest": manifest,
+            "zip_path": zip_path,
+            "stage": "job:done",
+            "message": "Recovered from files on disk",
+            "last_update_at": ts,
+        }
+    except Exception:
+        return None
+
+
 def _get_job_meta(job_id: str):
     """Get job meta from memory or disk; repopulate JOBS if needed."""
     meta = JOBS.get(job_id)
     if meta:
         return meta
     meta = _load_state(job_id)
+    if not meta:
+        meta = _reconstruct_job_meta(job_id)
     if meta:
         JOBS[job_id] = meta
     return meta
@@ -681,7 +726,16 @@ def _run_job(job_id: str, req: RunRequest) -> None:
             },
         )
 
-        # Optionally build zip for user download (zipping duplicates bytes temporarily).
+        # Persist public outputs and current meta before zipping so recovered jobs still expose analysis/manifest.
+        JOBS[job_id].update(
+            {
+                "analysis": analysis,
+                "manifest": manifest,
+            }
+        )
+        _write_state(job_id)
+
+        # Optionally build zip for user download. Build it OUTSIDE the source folder so the zip never contains itself.
         zip_path = None
         if req.include_zip:
             bytes_for_zip = _dir_size_bytes(job_dir)
@@ -691,7 +745,14 @@ def _run_job(job_id: str, req: RunRequest) -> None:
                     f"({bytes_for_zip/1024**2:.1f} MB). Try keep_rasters=false or reduce bbox/size_px."
                 )
             _job_event(job_id, "zip:start", "Building outputs zip")
-            zip_path = shutil.make_archive(os.path.join(job_dir, f"{job_id}_outputs"), "zip", job_dir)
+            zip_base = os.path.join(JOB_ROOT, f"{job_id}_outputs")
+            zip_final = zip_base + ".zip"
+            try:
+                if os.path.exists(zip_final):
+                    os.remove(zip_final)
+            except Exception:
+                pass
+            zip_path = shutil.make_archive(zip_base, "zip", job_dir)
             _job_event(job_id, "zip:done", "ZIP ready")
 
         _job_event(job_id, "job:done", "Job finished successfully")
