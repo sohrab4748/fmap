@@ -27,6 +27,8 @@ import logging
 import threading
 import io
 import faulthandler
+import urllib.request
+import urllib.error
 
 from fmap_download import run_download_pipeline, ncss_point_csv, GRIDMET_DATASETS, spi_gamma_monthly
 from fmap_analysis import run_analysis, build_manifest
@@ -1706,3 +1708,98 @@ def fmap_timeseries(job_id: str, kind: str = "point", freq: str = "daily") -> Re
 
     with open(path, "r", encoding="utf-8") as f:
         return Response(content=f.read(), media_type="application/json")
+
+
+class GeminiRequest(BaseModel):
+    job_id: str
+    prompt: str = ""
+
+
+def _extract_gemini_text(resp_json: dict) -> str:
+    try:
+        parts = (((resp_json.get("candidates") or [])[0].get("content") or {}).get("parts") or [])
+        texts = [p.get("text", "") for p in parts if isinstance(p, dict) and p.get("text")]
+        if texts:
+            return "\n".join(texts).strip()
+    except Exception:
+        pass
+    return json.dumps(resp_json, ensure_ascii=False, indent=2)
+
+
+@app.post("/ai/gemini")
+def ai_gemini(req: GeminiRequest):
+    api_key = (os.getenv("GEMINI_API_KEY") or "").strip()
+    if not api_key:
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY is not set")
+
+    meta = _get_job_meta(req.job_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="Unknown job_id")
+
+    status = (meta.get("status") or "").lower()
+    if status in ("queued", "running"):
+        raise HTTPException(status_code=409, detail="Job is not finished yet")
+    if status == "error":
+        raise HTTPException(status_code=500, detail=meta.get("error") or "Job failed")
+
+    job_dir = meta.get("job_dir") or _job_dir(req.job_id)
+    analysis_path = os.path.join(job_dir, "analysis_result.json")
+
+    analysis = meta.get("analysis") or {}
+    if os.path.exists(analysis_path):
+        try:
+            with open(analysis_path, "r", encoding="utf-8") as f:
+                analysis = json.load(f)
+        except Exception:
+            pass
+
+    user_prompt = (req.prompt or "").strip()
+    if not user_prompt:
+        user_prompt = (
+            "Please provide a clear scientific summary of this FMAP forest analysis result, "
+            "including land cover, vegetation condition, climate and drought, disturbance, burn, "
+            "biomass and carbon, and LANDFIRE outputs if available. Mention any missing sections clearly."
+        )
+
+    prompt_text = (
+        "You are assisting with FMAP-AI forest analysis interpretation.\n\n"
+        "Write a concise but useful scientific summary based on the JSON below. "
+        "If some sections are unavailable, say so clearly.\n\n"
+        f"User request:\n{user_prompt}\n\n"
+        "analysis_result.json:\n"
+        f"{json.dumps(analysis, ensure_ascii=False)}"
+    )
+
+    model = (os.getenv("GEMINI_MODEL") or "gemini-1.5-flash").strip()
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model}:generateContent?key={api_key}"
+    )
+
+    payload = {
+        "contents": [{"parts": [{"text": prompt_text}]}],
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2048},
+    }
+
+    body = json.dumps(payload).encode("utf-8")
+    http_req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(http_req, timeout=120) as resp:
+            resp_json = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="ignore")
+        raise HTTPException(status_code=502, detail=f"Gemini HTTPError: {detail}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Gemini request failed: {e}")
+
+    return {
+        "model": model,
+        "text": _extract_gemini_text(resp_json),
+        "raw": resp_json,
+    }
