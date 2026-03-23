@@ -1756,17 +1756,31 @@ def ai_gemini(req: GeminiRequest):
     user_prompt = (req.prompt or "").strip()
     if not user_prompt:
         user_prompt = (
-            "Please provide a clear scientific summary of this FMAP forest analysis result, "
-            "including land cover, vegetation condition, climate and drought, disturbance, burn, "
-            "biomass and carbon, and LANDFIRE outputs if available. Mention any missing sections clearly."
+            "Please give a detailed overall interpretation of this FMAP-AI region/site. "
+            "Discuss the area as a whole, not only the exact point. Cover land cover and canopy context, "
+            "vegetation condition, climate and drought, disturbance and burn indicators, biomass and carbon, "
+            "and LANDFIRE information if available. Explain what these results suggest about the general forest "
+            "condition of the region, mention important limitations or missing sections clearly, and end with a "
+            "short final opinion for forestry use."
         )
 
     prompt_text = (
-        "You are assisting with FMAP-AI forest analysis interpretation.\n\n"
-        "Write a concise but useful scientific summary based on the JSON below. "
-        "If some sections are unavailable, say so clearly.\n\n"
-        f"User request:\n{user_prompt}\n\n"
-        "analysis_result.json:\n"
+        "You are assisting with FMAP-AI forest analysis interpretation.
+
+"
+        "Write a detailed, well-structured interpretation based on the JSON below. Focus on the overall region/site, "
+        "not only the exact point. Use clear section headings: 1) Overall regional/site impression, 2) Land cover and canopy, "
+        "3) Vegetation condition, 4) Climate and drought, 5) Disturbance and burn, 6) Biomass/carbon and LANDFIRE, "
+        "7) Limitations/uncertainties, 8) Final forestry opinion. If some sections are unavailable, say so clearly. "
+        "Do not be too short.
+
+"
+        f"User request:
+{user_prompt}
+
+"
+        "analysis_result.json:
+"
         f"{json.dumps(analysis, ensure_ascii=False)}"
     )
 
@@ -1778,7 +1792,7 @@ def ai_gemini(req: GeminiRequest):
 
     payload = {
         "contents": [{"parts": [{"text": prompt_text}]}],
-        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 2048},
+        "generationConfig": {"temperature": 0.25, "maxOutputTokens": 3072},
     }
 
     body = json.dumps(payload).encode("utf-8")
