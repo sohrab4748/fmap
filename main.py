@@ -1776,7 +1776,7 @@ def ai_gemini(req: GeminiRequest):
         f"{json.dumps(analysis, ensure_ascii=False)}"
     )
 
-    model = (os.getenv("GEMINI_MODEL") or "gemini-1.5-flash").strip()
+    model = (os.getenv("GEMINI_MODEL") or "gemini-2.5-flash").strip()
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
         f"{model}:generateContent?key={api_key}"
