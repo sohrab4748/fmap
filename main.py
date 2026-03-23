@@ -1759,9 +1759,9 @@ def ai_gemini(req: GeminiRequest):
             "Please give a detailed overall interpretation of this FMAP-AI region/site. "
             "Discuss the area as a whole, not only the exact point. Cover land cover and canopy context, "
             "vegetation condition, climate and drought, disturbance and burn indicators, biomass and carbon, "
-            "and LANDFIRE information if available. Explain what these results suggest about the general forest "
-            "condition of the region, mention important limitations or missing sections clearly, and end with a "
-            "short final opinion for forestry use."
+            "LANDFIRE information if available, and whether the surrounding region appears ecologically meaningful "
+            "for forestry attention. Mention important limitations or missing sections clearly, and end with a "
+            "practical final opinion for forestry use, field screening, or follow-up study."
         )
 
     prompt_text = (
@@ -1784,7 +1784,7 @@ def ai_gemini(req: GeminiRequest):
 
     payload = {
         "contents": [{"parts": [{"text": prompt_text}]}],
-        "generationConfig": {"temperature": 0.25, "maxOutputTokens": 3072},
+        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 8192},
     }
 
     body = json.dumps(payload).encode("utf-8")
@@ -1807,5 +1807,6 @@ def ai_gemini(req: GeminiRequest):
     return {
         "model": model,
         "text": _extract_gemini_text(resp_json),
+        "finish_reason": (((resp_json.get("candidates") or [])[0]) or {}).get("finishReason"),
         "raw": resp_json,
     }
