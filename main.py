@@ -1765,26 +1765,18 @@ def ai_gemini(req: GeminiRequest):
         )
 
     prompt_text = (
-        "You are assisting with FMAP-AI forest analysis interpretation.
-
-"
+        "You are assisting with FMAP-AI forest analysis interpretation.\n\n"
         "Write a detailed, well-structured interpretation based on the JSON below. Focus on the overall region/site, "
         "not only the exact point. Use clear section headings: 1) Overall regional/site impression, 2) Land cover and canopy, "
         "3) Vegetation condition, 4) Climate and drought, 5) Disturbance and burn, 6) Biomass/carbon and LANDFIRE, "
         "7) Limitations/uncertainties, 8) Final forestry opinion. If some sections are unavailable, say so clearly. "
-        "Do not be too short.
-
-"
-        f"User request:
-{user_prompt}
-
-"
-        "analysis_result.json:
-"
+        "Do not be too short.\n\n"
+        f"User request:\n{user_prompt}\n\n"
+        "analysis_result.json:\n"
         f"{json.dumps(analysis, ensure_ascii=False)}"
     )
 
-    model = (os.getenv("GEMINI_MODEL") or "gemini-2.5-flash").strip()
+    model = (os.getenv("GEMINI_MODEL") or "gemini-1.5-flash").strip()
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
         f"{model}:generateContent?key={api_key}"
